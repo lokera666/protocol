@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "../libraries/Throttle.sol";
 import "./IAsset.sol";
 import "./IDistributor.sol";
-import "./IFacade.sol";
 import "./IGnosis.sol";
 import "./IMain.sol";
 import "./IRToken.sol";
 import "./IStRSR.sol";
 import "./ITrade.sol";
+import "./IVersioned.sol";
 
 /**
  * @title DeploymentParams
@@ -17,34 +18,38 @@ import "./ITrade.sol";
  * meaning that after deployment there is freedom to allow parametrizations to deviate.
  */
 struct DeploymentParams {
-    // === RToken trade sizing ===
-    TradingRange rTokenTradingRange; // {rTok}
-    //
     // === Revenue sharing ===
     RevenueShare dist; // revenue sharing splits between RToken and RSR
     //
+    // === Trade sizing ===
+    uint192 minTradeVolume; // {UoA}
+    uint192 rTokenMaxTradeVolume; // {UoA}
+    //
+    // === Freezing ===
+    uint48 shortFreeze; // {s} how long an initial freeze lasts
+    uint48 longFreeze; // {s} how long each freeze extension lasts
+    //
     // === Rewards (Furnace + StRSR) ===
-    uint48 rewardPeriod; // {s} the atomic unit of rewards, determines # of exponential rounds
-    uint192 rewardRatio; // the fraction of available revenues that stRSR holders get each PayPeriod
+    uint192 rewardRatio; // the fraction of available revenues that are paid out each block period
     //
     // === StRSR ===
     uint48 unstakingDelay; // {s} the "thawing time" of staked RSR before withdrawal
+    uint192 withdrawalLeak; // {1} fraction of RSR that can be withdrawn without refresh
+    //
+    // === BasketHandler ===
+    uint48 warmupPeriod; // {s} how long to wait until issuance/trading after regaining SOUND
+    bool reweightable; // whether the target amounts in the prime basket can change
     //
     // === BackingManager ===
     uint48 tradingDelay; // {s} how long to wait until starting auctions after switching basket
-    uint48 auctionLength; // {s} the length of an auction
+    uint48 batchAuctionLength; // {s} the length of a Gnosis EasyAuction
+    uint48 dutchAuctionLength; // {s} the length of a falling-price dutch auction
     uint192 backingBuffer; // {1} how much extra backing collateral to keep
     uint192 maxTradeSlippage; // {1} max slippage acceptable in a trade
     //
-    // === Pausing ===
-    uint48 shortFreeze; // {s} how long an initial freeze lasts
-    uint48 longFreeze; // {s} how long each freeze extension lasts
-    // === RToken ===
-    uint192 issuanceRate; // {1} number of RToken to issue per block / (RToken value)
-    uint192 maxRedemptionCharge; // {1} max fraction of RToken supply that can be redeemed at once
-    uint256 redemptionVirtualSupply; // {qRTok}
-    // The min value of total supply to use for redemption throttling
-    // The redemption capacity is always at least maxRedemptionCharge * redemptionVirtualSupply
+    // === RToken Supply Throttles ===
+    ThrottleLib.Params issuanceThrottle; // see ThrottleLib
+    ThrottleLib.Params redemptionThrottle;
 }
 
 /**
@@ -54,25 +59,37 @@ struct DeploymentParams {
 struct Implementations {
     IMain main;
     Components components;
-    ITrade trade;
+    TradePlugins trading;
+}
+
+struct TradePlugins {
+    ITrade gnosisTrade;
+    ITrade dutchTrade;
 }
 
 /**
  * @title IDeployer
  * @notice Factory contract for an RToken system instance
  */
-interface IDeployer {
+interface IDeployer is IVersioned {
     /// Emitted when a new RToken and accompanying system is deployed
     /// @param main The address of `Main`
     /// @param rToken The address of the RToken ERC20
     /// @param stRSR The address of the StRSR ERC20 staking pool/token
     /// @param owner The owner of the newly deployed system
+    /// @param version The semantic versioning version string (see: https://semver.org)
     event RTokenCreated(
         IMain indexed main,
         IRToken indexed rToken,
         IStRSR stRSR,
-        address indexed owner
+        address indexed owner,
+        string version
     );
+
+    /// Emitted when a new RTokenAsset is deployed during `deployRTokenAsset`
+    /// @param rToken The address of the RToken ERC20
+    /// @param rTokenAsset The address of the RTokenAsset
+    event RTokenAssetCreated(IRToken indexed rToken, IAsset rTokenAsset);
 
     //
 
@@ -90,6 +107,10 @@ interface IDeployer {
         address owner,
         DeploymentParams calldata params
     ) external returns (address);
+
+    /// Deploys a new RTokenAsset instance. Not needed during normal deployment flow
+    /// @param maxTradeVolume {UoA} The maximum trade volume for the RTokenAsset
+    function deployRTokenAsset(IRToken rToken, uint192 maxTradeVolume) external returns (IAsset);
 }
 
 interface TestIDeployer is IDeployer {
@@ -101,7 +122,14 @@ interface TestIDeployer is IDeployer {
 
     function gnosis() external view returns (IGnosis);
 
-    function facade() external view returns (IFacade);
-
     function rsrAsset() external view returns (IAsset);
+
+    function implementations()
+        external
+        view
+        returns (
+            IMain,
+            Components memory,
+            TradePlugins memory
+        );
 }

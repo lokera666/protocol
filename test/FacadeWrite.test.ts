@@ -1,8 +1,17 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { ContractFactory, Wallet } from 'ethers'
-import { ethers, waffle } from 'hardhat'
-import { IConfig, IGovParams, IRTokenConfig, IRTokenSetup } from '../common/configuration'
+import { ContractFactory } from 'ethers'
+import { ethers } from 'hardhat'
+import { cloneDeep } from 'lodash'
+import {
+  IConfig,
+  IGovParams,
+  IGovRoles,
+  IRevenueShare,
+  IRTokenConfig,
+  IRTokenSetup,
+} from '../common/configuration'
 import {
   CollateralStatus,
   SHORT_FREEZER,
@@ -11,28 +20,30 @@ import {
   OWNER,
   PAUSER,
   ZERO_ADDRESS,
+  ONE_DAY,
 } from '../common/constants'
 import { expectInIndirectReceipt, expectInReceipt } from '../common/events'
 import { bn, fp } from '../common/numbers'
-import { setOraclePrice } from './utils/oracles'
-import { advanceTime } from './utils/time'
+import { expectPrice, setOraclePrice } from './utils/oracles'
+import { advanceTime, getLatestBlockNumber } from './utils/time'
 import snapshotGasCost from './utils/snapshotGasCost'
 import {
   Asset,
   CTokenFiatCollateral,
   CTokenMock,
   ERC20Mock,
-  IBasketHandler,
-  Facade,
+  FacadeTest,
   FacadeWrite,
   FiatCollateral,
   Governance,
   IAssetRegistry,
   RTokenAsset,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIBroker,
   TestIDeployer,
   TestIDistributor,
+  TestIFacade,
   TestIFurnace,
   TestIMain,
   TestIRevenueTrader,
@@ -41,18 +52,26 @@ import {
   TimelockController,
   USDCMock,
 } from '../typechain'
-import { Collateral, Implementation, IMPLEMENTATION, defaultFixture } from './fixtures'
-
-const createFixtureLoader = waffle.createFixtureLoader
+import {
+  Collateral,
+  Implementation,
+  IMPLEMENTATION,
+  defaultFixture,
+  ORACLE_ERROR,
+} from './fixtures'
+import { useEnv } from '#/utils/env'
 
 const describeGas =
-  IMPLEMENTATION == Implementation.P1 && process.env.REPORT_GAS ? describe : describe.skip
+  IMPLEMENTATION == Implementation.P1 && useEnv('REPORT_GAS') ? describe.only : describe.skip
 
 describe('FacadeWrite contract', () => {
   let deployerUser: SignerWithAddress
   let owner: SignerWithAddress
   let addr1: SignerWithAddress
   let addr2: SignerWithAddress
+  let addr3: SignerWithAddress
+  let beneficiary1: SignerWithAddress
+  let beneficiary2: SignerWithAddress
 
   // RSR
   let rsr: ERC20Mock
@@ -61,7 +80,7 @@ describe('FacadeWrite contract', () => {
   // Tokens
   let token: ERC20Mock
   let usdc: USDCMock
-  let cToken: CTokenMock
+  let cToken: ERC20Mock
   let basket: Collateral[]
 
   // Aave / Comp
@@ -85,14 +104,15 @@ describe('FacadeWrite contract', () => {
   let timelock: TimelockController
 
   // Facade
-  let facade: Facade
+  let facade: TestIFacade
+  let facadeTest: FacadeTest
   let facadeWriteLibAddr: string
 
   // Core contracts
   let main: TestIMain
   let assetRegistry: IAssetRegistry
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
+  let basketHandler: TestIBasketHandler
   let broker: TestIBroker
   let distributor: TestIDistributor
   let furnace: TestIFurnace
@@ -105,22 +125,18 @@ describe('FacadeWrite contract', () => {
   let rTokenConfig: IRTokenConfig
   let rTokenSetup: IRTokenSetup
   let govParams: IGovParams
+  let govRoles: IGovRoles
 
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
-
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
+  let revShare1: IRevenueShare
+  let revShare2: IRevenueShare
 
   beforeEach(async () => {
-    ;[deployerUser, owner, addr1, addr2] = await ethers.getSigners()
+    ;[deployerUser, owner, addr1, addr2, addr3, beneficiary1, beneficiary2] =
+      await ethers.getSigners()
 
     // Deploy fixture
-    ;({ rsr, compToken, compAsset, basket, config, facade, deployer } = await loadFixture(
-      defaultFixture
-    ))
+    ;({ rsr, compToken, compAsset, basket, config, facade, facadeTest, deployer } =
+      await loadFixture(defaultFixture))
 
     // Get assets and tokens
     tokenAsset = <FiatCollateral>basket[0]
@@ -143,12 +159,20 @@ describe('FacadeWrite contract', () => {
     })
     facadeWrite = <FacadeWrite>await FacadeFactory.deploy(deployer.address)
 
+    revShare1 = { rTokenDist: bn('2'), rsrDist: bn('3') } // 0.5% for beneficiary1
+    revShare2 = { rTokenDist: bn('4'), rsrDist: bn('6') } // 1% for beneficiary2
+
+    // Decrease revenue splits for nicer rounding
+    const localConfig = cloneDeep(config)
+    localConfig.dist.rTokenDist = bn('394')
+    localConfig.dist.rsrDist = bn('591')
+
     // Set parameters
     rTokenConfig = {
       name: 'RTKN RToken',
       symbol: 'RTKN',
       mandate: 'mandate',
-      params: config,
+      params: localConfig,
     }
 
     rTokenSetup = {
@@ -162,15 +186,28 @@ describe('FacadeWrite contract', () => {
           backupCollateral: [cTokenAsset.address],
         },
       ],
+      beneficiaries: [
+        { beneficiary: beneficiary1.address, revShare: revShare1 },
+        { beneficiary: beneficiary2.address, revShare: revShare2 },
+      ],
     }
 
     // Set governance params
     govParams = {
-      votingDelay: bn(5), // 5 blocks
-      votingPeriod: bn(100), // 100 blocks
+      votingDelay: ONE_DAY, // 1 day
+      votingPeriod: ONE_DAY.mul(3), // 3 days
       proposalThresholdAsMicroPercent: bn(1e6), // 1%
       quorumPercent: bn(4), // 4%
       timelockDelay: bn(60 * 60 * 24), // 1 day
+    }
+
+    // Set initial governance roles
+    govRoles = {
+      owner: owner.address,
+      guardian: ZERO_ADDRESS,
+      pausers: [],
+      shortFreezers: [],
+      longFreezers: [],
     }
   })
 
@@ -188,47 +225,76 @@ describe('FacadeWrite contract', () => {
   })
 
   it('Should perform validations', async () => {
-    // Set parameters
-    rTokenConfig = {
-      name: 'RTKN RToken',
-      symbol: 'RTKN',
-      mandate: 'mandate',
-      params: config,
-    }
+    // Cannot deploy with duplicate collateral
+    rTokenSetup.primaryBasket = [tokenAsset.address, tokenAsset.address]
+    rTokenSetup.weights = [fp('0.5'), fp('0.5')]
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('duplicate collateral')
 
-    rTokenSetup = {
-      assets: [compAsset.address],
-      primaryBasket: [tokenAsset.address, usdcAsset.address],
-      weights: [fp('0.5'), fp('0.5')],
-      backups: [
-        {
-          backupUnit: ethers.utils.formatBytes32String('USD'),
-          diversityFactor: bn(1),
-          backupCollateral: [cTokenAsset.address],
-        },
-      ],
-    }
+    // Cannot deploy with duplicate asset
+    rTokenSetup.assets = [tokenAsset.address, tokenAsset.address]
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('duplicate asset')
+
+    // Should not accept zero addr beneficiary
+    rTokenSetup.beneficiaries = [{ beneficiary: ZERO_ADDRESS, revShare: revShare1 }]
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('beneficiary revShare mismatch')
+
+    // Should not accept empty revShare
+    rTokenSetup.beneficiaries = [
+      { beneficiary: beneficiary1.address, revShare: { rsrDist: bn(0), rTokenDist: bn(0) } },
+    ]
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('beneficiary revShare mismatch')
+
+    // Cannot deploy backup info with no collateral tokens
+    rTokenSetup.backups[0].backupCollateral = []
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('no backup collateral')
+
+    // Cannot deploy with invalid length in weights
+    rTokenSetup.weights = [fp('1')]
+    await expect(
+      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).to.be.revertedWith('invalid length')
 
     // Cannot deploy with no basket
     rTokenSetup.primaryBasket = []
     await expect(
       facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
     ).to.be.revertedWith('no collateral')
+  })
 
-    // Cannot deploy with invalid length in weights
-    rTokenSetup.primaryBasket = [tokenAsset.address, usdcAsset.address]
-    rTokenSetup.weights = [fp('1')]
-    await expect(
-      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
-    ).to.be.revertedWith('invalid length')
+  it('Should allow all rev share to go to RSR stakers', async () => {
+    rTokenSetup.beneficiaries = [
+      { beneficiary: beneficiary1.address, revShare: { rsrDist: bn(1), rTokenDist: bn(0) } },
+    ]
+    // Deploy RToken via FacadeWrite
+    const receipt = await (
+      await facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).wait()
 
-    // Cannot deploy backup info with no collateral tokens
-    rTokenSetup.primaryBasket = [tokenAsset.address, usdcAsset.address]
-    rTokenSetup.weights = [fp('0.5'), fp('0.5')]
-    rTokenSetup.backups[0].backupCollateral = []
-    await expect(
-      facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
-    ).to.be.revertedWith('no backup collateral')
+    const mainAddr = expectInIndirectReceipt(receipt, deployer.interface, 'RTokenCreated').args.main
+    main = <TestIMain>await ethers.getContractAt('TestIMain', mainAddr)
+  })
+
+  it('Should allow all rev share to go to RToken holders', async () => {
+    rTokenSetup.beneficiaries = [
+      { beneficiary: beneficiary1.address, revShare: { rsrDist: bn(0), rTokenDist: bn(1) } },
+    ]
+    // Deploy RToken via FacadeWrite
+    const receipt = await (
+      await facadeWrite.connect(deployerUser).deployRToken(rTokenConfig, rTokenSetup)
+    ).wait()
+
+    const mainAddr = expectInIndirectReceipt(receipt, deployer.interface, 'RTokenCreated').args.main
+    main = <TestIMain>await ethers.getContractAt('TestIMain', mainAddr)
   })
 
   describe('Deployment Process', () => {
@@ -249,8 +315,8 @@ describe('FacadeWrite contract', () => {
       backingManager = <TestIBackingManager>(
         await ethers.getContractAt('TestIBackingManager', await main.backingManager())
       )
-      basketHandler = <IBasketHandler>(
-        await ethers.getContractAt('IBasketHandler', await main.basketHandler())
+      basketHandler = <TestIBasketHandler>(
+        await ethers.getContractAt('TestIBasketHandler', await main.basketHandler())
       )
 
       broker = <TestIBroker>await ethers.getContractAt('TestIBroker', await main.broker())
@@ -315,12 +381,14 @@ describe('FacadeWrite contract', () => {
         expect(await main.hasRole(PAUSER, deployerUser.address)).to.equal(false)
 
         expect(await main.hasRole(OWNER, facadeWrite.address)).to.equal(true)
-        expect(await main.hasRole(SHORT_FREEZER, facadeWrite.address)).to.equal(true)
-        expect(await main.hasRole(LONG_FREEZER, facadeWrite.address)).to.equal(true)
-        expect(await main.hasRole(PAUSER, facadeWrite.address)).to.equal(true)
+        expect(await main.hasRole(SHORT_FREEZER, facadeWrite.address)).to.equal(false)
+        expect(await main.hasRole(LONG_FREEZER, facadeWrite.address)).to.equal(false)
+        expect(await main.hasRole(PAUSER, facadeWrite.address)).to.equal(false)
         expect(await main.frozen()).to.equal(false)
-        expect(await main.paused()).to.equal(true)
-        expect(await main.pausedOrFrozen()).to.equal(true)
+        expect(await main.tradingPaused()).to.equal(true)
+        expect(await main.tradingPausedOrFrozen()).to.equal(true)
+        expect(await main.issuancePaused()).to.equal(true)
+        expect(await main.issuancePausedOrFrozen()).to.equal(true)
 
         // RToken
         expect(await assetRegistry.toAsset(rToken.address)).to.equal(rTokenAsset.address)
@@ -348,6 +416,15 @@ describe('FacadeWrite contract', () => {
         expect(await stRSR.decimals()).to.equal(18)
         expect(await stRSR.totalSupply()).to.equal(0)
         expect(await stRSR.main()).to.equal(main.address)
+
+        // Distributor
+        const dist1 = await distributor.distribution(beneficiary1.address)
+        expect(dist1[0]).to.equal(rTokenSetup.beneficiaries[0].revShare.rTokenDist)
+        expect(dist1[1]).to.equal(rTokenSetup.beneficiaries[0].revShare.rsrDist)
+
+        const dist2 = await distributor.distribution(beneficiary2.address)
+        expect(dist2[0]).to.equal(rTokenSetup.beneficiaries[1].revShare.rTokenDist)
+        expect(dist2[1]).to.equal(rTokenSetup.beneficiaries[1].revShare.rsrDist)
       })
 
       it('Should register Assets/Collateral correctly', async () => {
@@ -379,28 +456,23 @@ describe('FacadeWrite contract', () => {
       })
 
       it('Should grant allowances to RToken correctly', async () => {
-        // Basket
-        const backing = await facade.basketTokens(rToken.address)
-        expect(backing[0]).to.equal(token.address)
-        expect(backing[1]).to.equal(usdc.address)
-
-        expect(await token.allowance(backingManager.address, rToken.address)).to.equal(MAX_UINT256)
-        expect(await usdc.allowance(backingManager.address, rToken.address)).to.equal(MAX_UINT256)
+        const erc20s = await assetRegistry.erc20s()
+        for (const erc20 of erc20s) {
+          // Should have allowances for everything except RToken + RSR
+          if (erc20 != rToken.address && erc20 != rsr.address) {
+            const ERC20 = await ethers.getContractAt('ERC20Mock', erc20)
+            expect(await ERC20.allowance(backingManager.address, rToken.address)).to.equal(
+              MAX_UINT256
+            )
+          }
+        }
       })
 
       it('Should not allow to complete setup if not deployer', async () => {
         await expect(
           facadeWrite
             .connect(addr1)
-            .setupGovernance(
-              rToken.address,
-              false,
-              false,
-              govParams,
-              owner.address,
-              ZERO_ADDRESS,
-              ZERO_ADDRESS
-            )
+            .setupGovernance(rToken.address, false, false, govParams, govRoles)
         ).to.be.revertedWith('not initial deployer')
       })
 
@@ -408,29 +480,16 @@ describe('FacadeWrite contract', () => {
         await expect(
           facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              true,
-              false,
-              govParams,
-              owner.address,
-              ZERO_ADDRESS,
-              ZERO_ADDRESS
-            )
+            .setupGovernance(rToken.address, true, false, govParams, govRoles)
         ).to.be.revertedWith('owner should be empty')
 
-        await expect(
+        // Remove owner
+        const noOwnerGovRoles = { ...govRoles }
+        noOwnerGovRoles.owner = ZERO_ADDRESS
+        govRoles.owner = await expect(
           facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              false,
-              false,
-              govParams,
-              ZERO_ADDRESS,
-              ZERO_ADDRESS,
-              ZERO_ADDRESS
-            )
+            .setupGovernance(rToken.address, false, false, govParams, noOwnerGovRoles)
         ).to.be.revertedWith('owner not defined')
       })
     })
@@ -438,22 +497,18 @@ describe('FacadeWrite contract', () => {
     describe('Phase 2 - Complete Setup', () => {
       context('Without deploying Governance - Paused', function () {
         beforeEach(async () => {
+          // Setup pauser
+          const newGovRoles = { ...govRoles }
+          newGovRoles.pausers.push(addr1.address)
+
           await facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              false,
-              false,
-              govParams,
-              owner.address,
-              ZERO_ADDRESS,
-              ZERO_ADDRESS
-            )
+            .setupGovernance(rToken.address, false, false, govParams, newGovRoles)
         })
 
         it('Should register Basket correctly', async () => {
-          // Unpause
-          await main.connect(owner).unpause()
+          await main.connect(addr1).unpauseTrading()
+          await main.connect(addr1).unpauseIssuance()
 
           // Basket
           expect(await basketHandler.fullyCollateralized()).to.equal(true)
@@ -464,13 +519,12 @@ describe('FacadeWrite contract', () => {
           expect(backing.length).to.equal(2)
 
           // Check other values
-          expect((await basketHandler.lastSet())[0]).to.be.gt(bn(0))
+          expect(await basketHandler.timestamp()).to.be.gt(bn(0))
           expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
-          expect(await basketHandler.price()).to.equal(fp('1'))
-          expect(await facade.callStatic.totalAssetValue(rToken.address)).to.equal(0)
+          expect(await facadeTest.callStatic.totalAssetValue(rToken.address)).to.equal(0)
 
           // Check BU price
-          expect(await basketHandler.price()).to.equal(fp('1'))
+          await expectPrice(basketHandler.address, fp('1'), ORACLE_ERROR, true)
         })
 
         it('Should setup backup basket correctly', async () => {
@@ -517,9 +571,15 @@ describe('FacadeWrite contract', () => {
 
         it('Should setup roles correctly', async () => {
           expect(await main.hasRole(OWNER, owner.address)).to.equal(true)
-          expect(await main.hasRole(SHORT_FREEZER, owner.address)).to.equal(true)
-          expect(await main.hasRole(LONG_FREEZER, owner.address)).to.equal(true)
-          expect(await main.hasRole(PAUSER, owner.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, owner.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, owner.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, owner.address)).to.equal(false)
+
+          // Pauser
+          expect(await main.hasRole(OWNER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, addr1.address)).to.equal(true)
 
           expect(await main.hasRole(OWNER, facadeWrite.address)).to.equal(false)
           expect(await main.hasRole(SHORT_FREEZER, facadeWrite.address)).to.equal(false)
@@ -532,58 +592,57 @@ describe('FacadeWrite contract', () => {
           expect(await main.hasRole(PAUSER, deployerUser.address)).to.equal(false)
 
           expect(await main.frozen()).to.equal(false)
-          expect(await main.paused()).to.equal(true)
-          expect(await main.pausedOrFrozen()).to.equal(true)
+          expect(await main.tradingPaused()).to.equal(true)
+          expect(await main.tradingPausedOrFrozen()).to.equal(true)
+          expect(await main.issuancePaused()).to.equal(true)
+          expect(await main.issuancePausedOrFrozen()).to.equal(true)
         })
 
         it('Should not allow to complete setup again if already complete', async () => {
           await expect(
             facadeWrite
               .connect(deployerUser)
-              .setupGovernance(
-                rToken.address,
-                false,
-                false,
-                govParams,
-                owner.address,
-                ZERO_ADDRESS,
-                ZERO_ADDRESS
-              )
+              .setupGovernance(rToken.address, false, false, govParams, govRoles)
           ).to.be.revertedWith('ownership already transferred')
         })
       })
 
       context('Without deploying Governance - Unpaused', function () {
         beforeEach(async () => {
+          // Setup guardian, pauser, and freezers
+          const newGovRoles = { ...govRoles }
+          newGovRoles.guardian = addr1.address
+          newGovRoles.pausers.push(addr2.address)
+          newGovRoles.shortFreezers.push(addr2.address)
+          newGovRoles.longFreezers.push(owner.address) // make owner freezer
+          newGovRoles.longFreezers.push(addr3.address) // add another long freezer
+
           // Deploy RToken via FacadeWrite
           await facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              false,
-              true,
-              govParams,
-              owner.address,
-              addr1.address,
-              addr2.address
-            )
+            .setupGovernance(rToken.address, false, true, govParams, newGovRoles)
         })
 
         it('Should setup owner, freezer and pauser correctly', async () => {
           expect(await main.hasRole(OWNER, owner.address)).to.equal(true)
-          expect(await main.hasRole(SHORT_FREEZER, owner.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, owner.address)).to.equal(false)
           expect(await main.hasRole(LONG_FREEZER, owner.address)).to.equal(true)
-          expect(await main.hasRole(PAUSER, owner.address)).to.equal(true)
+          expect(await main.hasRole(PAUSER, owner.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, addr1.address)).to.equal(false)
-          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(true)
-          expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(true)
-          expect(await main.hasRole(PAUSER, addr1.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, addr1.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, addr2.address)).to.equal(false)
-          expect(await main.hasRole(SHORT_FREEZER, addr2.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr2.address)).to.equal(true)
           expect(await main.hasRole(LONG_FREEZER, addr2.address)).to.equal(false)
           expect(await main.hasRole(PAUSER, addr2.address)).to.equal(true)
+
+          expect(await main.hasRole(OWNER, addr3.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr3.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, addr3.address)).to.equal(true)
+          expect(await main.hasRole(PAUSER, addr3.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, facadeWrite.address)).to.equal(false)
           expect(await main.hasRole(SHORT_FREEZER, facadeWrite.address)).to.equal(false)
@@ -596,26 +655,29 @@ describe('FacadeWrite contract', () => {
           expect(await main.hasRole(PAUSER, deployerUser.address)).to.equal(false)
 
           expect(await main.frozen()).to.equal(false)
-          expect(await main.paused()).to.equal(false)
-          expect(await main.pausedOrFrozen()).to.equal(false)
+          expect(await main.tradingPaused()).to.equal(false)
+          expect(await main.tradingPausedOrFrozen()).to.equal(false)
+          expect(await main.issuancePaused()).to.equal(false)
+          expect(await main.issuancePausedOrFrozen()).to.equal(false)
         })
       })
 
       context('Deploying Governance - Paused', function () {
         beforeEach(async () => {
+          // Setup guardian
+          const newGovRoles = { ...govRoles }
+          newGovRoles.owner = ZERO_ADDRESS
+          newGovRoles.guardian = addr1.address
+          newGovRoles.pausers.push(addr1.address)
+          newGovRoles.pausers.push(addr2.address)
+          newGovRoles.shortFreezers.push(addr2.address)
+          newGovRoles.shortFreezers.push(addr3.address)
+
           // Deploy RToken via FacadeWrite
           const receipt = await (
             await facadeWrite
               .connect(deployerUser)
-              .setupGovernance(
-                rToken.address,
-                true,
-                false,
-                govParams,
-                ZERO_ADDRESS,
-                addr1.address,
-                ZERO_ADDRESS
-              )
+              .setupGovernance(rToken.address, true, false, govParams, newGovRoles)
           ).wait()
 
           // Get Governor and Timelock
@@ -625,23 +687,34 @@ describe('FacadeWrite contract', () => {
           timelock = <TimelockController>(
             await ethers.getContractAt('TimelockController', timelockAddr)
           )
+          expect(await timelock.hasRole(await timelock.EXECUTOR_ROLE(), governor.address)).to.equal(
+            true
+          )
+          expect(
+            await timelock.hasRole(await timelock.CANCELLER_ROLE(), governor.address)
+          ).to.equal(true)
         })
 
         it('Should setup owner, freezer and pauser correctly', async () => {
           expect(await main.hasRole(OWNER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(SHORT_FREEZER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(LONG_FREEZER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(PAUSER, timelock.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, timelock.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, timelock.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, timelock.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, addr1.address)).to.equal(false)
-          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(true)
-          expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(false)
           expect(await main.hasRole(PAUSER, addr1.address)).to.equal(true)
 
           expect(await main.hasRole(OWNER, addr2.address)).to.equal(false)
-          expect(await main.hasRole(SHORT_FREEZER, addr2.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr2.address)).to.equal(true)
           expect(await main.hasRole(LONG_FREEZER, addr2.address)).to.equal(false)
-          expect(await main.hasRole(PAUSER, addr2.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, addr2.address)).to.equal(true)
+
+          expect(await main.hasRole(OWNER, addr3.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr3.address)).to.equal(true)
+          expect(await main.hasRole(LONG_FREEZER, addr3.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, addr3.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, facadeWrite.address)).to.equal(false)
           expect(await main.hasRole(SHORT_FREEZER, facadeWrite.address)).to.equal(false)
@@ -654,17 +727,24 @@ describe('FacadeWrite contract', () => {
           expect(await main.hasRole(PAUSER, deployerUser.address)).to.equal(false)
 
           expect(await main.frozen()).to.equal(false)
-          expect(await main.paused()).to.equal(true)
-          expect(await main.pausedOrFrozen()).to.equal(true)
+          expect(await main.tradingPaused()).to.equal(true)
+          expect(await main.tradingPausedOrFrozen()).to.equal(true)
+          expect(await main.issuancePaused()).to.equal(true)
+          expect(await main.issuancePausedOrFrozen()).to.equal(true)
         })
 
         it('Should deploy Governor correctly', async () => {
           expect(await governor.votingDelay()).to.equal(govParams.votingDelay)
           expect(await governor.votingPeriod()).to.equal(govParams.votingPeriod)
-          expect(await governor.proposalThreshold()).to.equal(
-            govParams.proposalThresholdAsMicroPercent
-          )
-          expect(await governor.name()).to.equal('Reserve Governor')
+
+          // the proposalThreshold won't work in P0 because it assumes IStRSRVotes
+          if (IMPLEMENTATION == Implementation.P1) {
+            // At 0 supply it should be 0
+            expect(await governor.proposalThreshold()).to.equal(0)
+            expect(await governor.quorum((await getLatestBlockNumber()) - 1)).to.equal(0)
+          }
+          expect(await governor.name()).to.equal('Governor Anastasius')
+
           // Quorum
           expect(await governor['quorumNumerator()']()).to.equal(govParams.quorumPercent)
           expect(await governor.timelock()).to.equal(timelock.address)
@@ -674,18 +754,21 @@ describe('FacadeWrite contract', () => {
 
       context('Deploying Governance - Unpaused', function () {
         beforeEach(async () => {
+          // Remove owner
+          const newGovRoles = { ...govRoles }
+          newGovRoles.owner = ZERO_ADDRESS
+          newGovRoles.pausers.push(addr1.address)
+          newGovRoles.shortFreezers.push(addr1.address)
+
+          // Should handle Zero addresses
+          newGovRoles.pausers.push(ZERO_ADDRESS)
+          newGovRoles.shortFreezers.push(ZERO_ADDRESS)
+          newGovRoles.longFreezers.push(ZERO_ADDRESS)
+
           const receipt = await (
             await facadeWrite
               .connect(deployerUser)
-              .setupGovernance(
-                rToken.address,
-                true,
-                true,
-                govParams,
-                ZERO_ADDRESS,
-                ZERO_ADDRESS,
-                ZERO_ADDRESS
-              )
+              .setupGovernance(rToken.address, true, true, govParams, newGovRoles)
           ).wait()
 
           // Get Governor and Timelock
@@ -695,18 +778,21 @@ describe('FacadeWrite contract', () => {
           timelock = <TimelockController>(
             await ethers.getContractAt('TimelockController', timelockAddr)
           )
+          expect(await timelock.hasRole(await timelock.EXECUTOR_ROLE(), governor.address)).to.equal(
+            true
+          )
         })
 
         it('Should setup owner, freezer and pauser correctly', async () => {
           expect(await main.hasRole(OWNER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(SHORT_FREEZER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(LONG_FREEZER, timelock.address)).to.equal(true)
-          expect(await main.hasRole(PAUSER, timelock.address)).to.equal(true)
+          expect(await main.hasRole(SHORT_FREEZER, timelock.address)).to.equal(false)
+          expect(await main.hasRole(LONG_FREEZER, timelock.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, timelock.address)).to.equal(false)
 
           expect(await main.hasRole(OWNER, addr1.address)).to.equal(false)
-          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(SHORT_FREEZER, addr1.address)).to.equal(true)
           expect(await main.hasRole(LONG_FREEZER, addr1.address)).to.equal(false)
-          expect(await main.hasRole(PAUSER, addr1.address)).to.equal(false)
+          expect(await main.hasRole(PAUSER, addr1.address)).to.equal(true)
 
           expect(await main.hasRole(OWNER, addr2.address)).to.equal(false)
           expect(await main.hasRole(SHORT_FREEZER, addr2.address)).to.equal(false)
@@ -724,8 +810,10 @@ describe('FacadeWrite contract', () => {
           expect(await main.hasRole(PAUSER, deployerUser.address)).to.equal(false)
 
           expect(await main.frozen()).to.equal(false)
-          expect(await main.paused()).to.equal(false)
-          expect(await main.pausedOrFrozen()).to.equal(false)
+          expect(await main.tradingPaused()).to.equal(false)
+          expect(await main.tradingPausedOrFrozen()).to.equal(false)
+          expect(await main.issuancePaused()).to.equal(false)
+          expect(await main.issuancePausedOrFrozen()).to.equal(false)
         })
       })
     })
@@ -738,36 +826,29 @@ describe('FacadeWrite contract', () => {
       })
 
       it('Phase 2 - Without governance', async () => {
+        const newGovRoles = { ...govRoles }
+        newGovRoles.guardian = addr1.address
+        newGovRoles.pausers.push(addr2.address)
+
         // Deploy RToken via FacadeWrite
         await snapshotGasCost(
           await facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              false,
-              false,
-              govParams,
-              owner.address,
-              addr1.address,
-              addr2.address
-            )
+            .setupGovernance(rToken.address, false, false, govParams, newGovRoles)
         )
       })
 
       it('Phase 2 - Deploy governance', async () => {
+        const newGovRoles = { ...govRoles }
+        newGovRoles.owner = ZERO_ADDRESS
+        newGovRoles.guardian = addr1.address
+        newGovRoles.pausers.push(addr2.address)
+
         // Deploy RToken via FacadeWrite
         await snapshotGasCost(
           await facadeWrite
             .connect(deployerUser)
-            .setupGovernance(
-              rToken.address,
-              true,
-              true,
-              govParams,
-              ZERO_ADDRESS,
-              addr1.address,
-              addr2.address
-            )
+            .setupGovernance(rToken.address, true, true, govParams, newGovRoles)
         )
       })
     })

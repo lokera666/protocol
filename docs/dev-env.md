@@ -1,17 +1,16 @@
-
-
 # Our Development Environment
 
 We're using:
 
 - [Hardhat](hardhat.org) to compile, test, and deploy our smart contracts.
-- [Slither][] and [Echidna][], from the [Trail of Bits contract security toolkit][tob-suite] for static analysis, fuzz checking, and differential testing.
+- [Slither][], [Slitherin][], and [Echidna][], from the [Trail of Bits contract security toolkit][tob-suite] for static analysis, fuzz checking, and differential testing.
 - [Prettier][] to auto-format both Solidity and Typescript (test) code
 - [Solhint][] for Solidity linting
 - [ESlint][] for Typescript linting
 
 [echidna]: https://github.com/crytic/echidna
 [slither]: https://github.com/crytic/slither
+[slitherin]: https://github.com/pessimistic-io/slitherin
 [tob-suite]: https://blog.trailofbits.com/2018/03/23/use-our-suite-of-ethereum-security-tools/
 [prettier]: https://prettier.io/
 [solhint]: https://protofire.github.io/solhint/
@@ -21,16 +20,18 @@ These instructions assume you already have standard installations of `node`, `np
 
 ## Setup
 
+### Basic Dependencies
+
 Set up yarn and hardhat, needed for compiling and running tests:
 
-``` bash
+```bash
 # If needed, install yarn
 npm install -g yarn
 
 # Clone this repo
 git clone git@github.com:reserve-protocol/protocol.git
 
-# Install pacakges from npm (including Solidity dependencies)
+# Install packages from npm (including Solidity dependencies)
 cd protocol
 yarn
 
@@ -41,18 +42,39 @@ yarn prepare
 cp .env.example .env
 ```
 
-You should also setup `slither`. The [Trail of Bits tools][tob-suite] require solc-select. Check [the installation instructions](https://github.com/crytic/solc-select) to ensure you have all prerequisites. Then:
+### Tenderly
+
+If you are going to use a Tenderly network, do the following:
+
+1. Install the [tenderly cli](https://github.com/Tenderly/tenderly-cli)
+2. Login
+
+```bash
+tenderly login --authentication-method access-key --access-key {your_access_key} --force
+```
+
+3. Configure the `TENDERLY_RPC_URL` in your `.env` file
+
+### Slither
+
+You should also setup `slither` and `slitherin`. The [Trail of Bits tools][tob-suite] require solc-select. Check [the installation instructions](https://github.com/crytic/solc-select) to ensure you have all prerequisites. Then:
 
 ```bash
 # Install solc-select and slither
 pip3 install solc-select slither-analyzer
 
-# Install and use solc version 0.8.9
-solc-select install 0.8.9
-solc-select use 0.8.9
+# Include slitherin detectors within slither
+pip3 install slitherin
+
+# Install and use solc version 0.8.19
+solc-select install 0.8.19
+solc-select use 0.8.19
 
 # Double-check that your slither version is at least 0.8.3!
 hash -r && slither --version
+
+# Slitherin version should be at least 0.7.0
+slitherin --version
 ```
 
 ## Usage
@@ -61,25 +83,20 @@ hash -r && slither --version
 - Autoformat solidity and typescript: `yarn prettier`
 - Report compiled contract sizes: `yarn size`
 - There are many available test sets. A few of the most useful are:
-    - Run only fast tests: `yarn test:fast`
-    - Run most tests: `yarn test`
-    - Run all tests (very slow!): `yarn test:exhaustive`
-    - Run tests and report test coverage: `yarn test:coverage`
-- Lint Solidity code: `yarn lint`
-- Lint Typescript code: `yarn eslint`
-- Run the Slither static checker: `yarn slither`
-- Run a local evm devchain: `yarn devchain`
-- Deploy our system to your local evm devchain: `yarn deploy`
+  - Run only fast tests: `yarn test:fast`
+  - Run P0 tests: `yarn test:p0`
+  - Run P1 tests: `yarn test:p1`
+  - Run plugin tests: `yarn test:plugins`
+  - Run integration tests: `yarn test:integration`
+  - Run tests and report test coverage: `yarn test:coverage`
+- Lint Solidity + Typescript code: `yarn lint`
+- Run the Slither static checker: `yarn slither` (will include Slitherin detectors)
+- Run a local mainnet fork devchain: `yarn devchain`
+- Deploy to devchain: `yarn deploy:run --network localhost`
 
 ## Mainnet Forking
 
-The tests located in `test/integration` will require the Mainnet Forking setup in place. This is done by setting the `MAINNET_RPC_URL` variable in your local `.env`. An Alchemy node is recommended for Mainnet Forking to properly work. Additional information can be found [here](https://hardhat.org/hardhat-network/guides/mainnet-forking.html).
-
-For running scripts and tasks using Mainnet Forking a `FORK` environment variable can be defined. For example to run a local node using Mainnet forking you can run:
-
-```bash
-FORK=true npx hardhat node
-```
+The tests located in `test/integration` will require the Mainnet Forking setup in place. This is done by setting the `MAINNET_RPC_URL` variable in your local `.env`. An Alchemy or Ankr node (something with archive data) is needed for Mainnet Forking to properly work. Additional information can be found [here](https://hardhat.org/hardhat-network/guides/mainnet-forking.html).
 
 ## Pre-push Validation
 
@@ -91,9 +108,12 @@ However, ensure that you do not change the value of `.husky/pre-push` in our sha
 
 ## Echidna
 
-We _have_ some tooling for testing with Echidna, but it is immature, out-of-date, and shouldn't be expected to work out-of-the-box. Still, there is some useful, tested support for working with Echidna, see our [echidna usage docs](using-echidna.md)
+We _have_ some tooling for testing with Echidna, but it is specifically in `fuzz` branch of the repo. See that branch and our [echidna usage docs](using-echidna.md)
 
 ## Test Deployment
 
 See our [deployment documentation](deployment.md).
 
+## Slither/Slitherin Analysis
+
+The ToB Sliter tool is run on any pull request, and is expected to be checked by devs for any unexpected high or medium issues raised. It also includes the additional Slitherin detectors developed by Pessimistic.

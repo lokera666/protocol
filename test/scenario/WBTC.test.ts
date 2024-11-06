@@ -1,31 +1,38 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { BigNumber, Wallet } from 'ethers'
-import { ethers, waffle } from 'hardhat'
+import { BigNumber } from 'ethers'
+import { ethers } from 'hardhat'
 import { bn, fp } from '../../common/numbers'
 import { advanceTime } from '../utils/time'
 import { IConfig } from '../../common/configuration'
-import { CollateralStatus, ZERO_ADDRESS } from '../../common/constants'
+import { CollateralStatus, TradeKind } from '../../common/constants'
 import {
   ERC20Mock,
   IAssetRegistry,
-  IBasketHandler,
+  IFacadeTest,
   MockV3Aggregator,
   NonFiatCollateral,
-  OracleLib,
   StaticATokenMock,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIStRSR,
   TestIRevenueTrader,
   TestIRToken,
 } from '../../typechain'
 import { getTrade } from '../utils/trades'
-import { Collateral, defaultFixture, IMPLEMENTATION, ORACLE_TIMEOUT } from '../fixtures'
+import {
+  Collateral,
+  defaultFixtureNoBasket,
+  IMPLEMENTATION,
+  ORACLE_ERROR,
+  ORACLE_TIMEOUT,
+  PRICE_TIMEOUT,
+} from '../fixtures'
+import { expectPrice } from '../utils/oracles'
 
-const DEFAULT_THRESHOLD = fp('0.05') // 5%
+const DEFAULT_THRESHOLD = fp('0.01') // 1%
 const DELAY_UNTIL_DEFAULT = bn('86400') // 24h
-
-const createFixtureLoader = waffle.createFixtureLoader
 
 describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
   let owner: SignerWithAddress
@@ -56,20 +63,12 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
   let rToken: TestIRToken
   let assetRegistry: IAssetRegistry
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
+  let basketHandler: TestIBasketHandler
   let rsrTrader: TestIRevenueTrader
   let rTokenTrader: TestIRevenueTrader
-  let oracleLib: OracleLib
-
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
+  let facadeTest: IFacadeTest
 
   let initialBal: BigNumber
-
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
 
   beforeEach(async () => {
     ;[owner, addr1, addr2] = await ethers.getSigners()
@@ -88,8 +87,8 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
       basketHandler,
       rsrTrader,
       rTokenTrader,
-      oracleLib,
-    } = await loadFixture(defaultFixture))
+      facadeTest,
+    } = await loadFixture(defaultFixtureNoBasket))
 
     // Main ERC20
     token0 = <StaticATokenMock>erc20s[7] // aDAI
@@ -103,19 +102,21 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
       await (await ethers.getContractFactory('MockV3Aggregator')).deploy(8, bn('1e8')) // 1 WBTC/BTC
     )
     wbtcCollateral = await (
-      await ethers.getContractFactory('NonFiatCollateral', {
-        libraries: { OracleLib: oracleLib.address },
-      })
+      await ethers.getContractFactory('NonFiatCollateral')
     ).deploy(
-      referenceUnitOracle.address,
+      {
+        priceTimeout: PRICE_TIMEOUT,
+        chainlinkFeed: referenceUnitOracle.address,
+        oracleError: ORACLE_ERROR,
+        erc20: wbtc.address,
+        maxTradeVolume: config.rTokenMaxTradeVolume,
+        oracleTimeout: ORACLE_TIMEOUT,
+        targetName: ethers.utils.formatBytes32String('BTC'),
+        defaultThreshold: DEFAULT_THRESHOLD,
+        delayUntilDefault: DELAY_UNTIL_DEFAULT,
+      },
       targetUnitOracle.address,
-      wbtc.address,
-      ZERO_ADDRESS,
-      config.rTokenTradingRange,
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('BTC'),
-      DEFAULT_THRESHOLD,
-      DELAY_UNTIL_DEFAULT
+      ORACLE_TIMEOUT
     )
 
     // Backup
@@ -132,6 +133,7 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
       backupToken.address,
     ])
     await basketHandler.refreshBasket()
+    await advanceTime(config.warmupPeriod.toNumber() + 1)
 
     await backingManager.grantRTokenAllowance(token0.address)
     await backingManager.grantRTokenAllowance(wbtc.address)
@@ -169,22 +171,32 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
 
     it('should sell appreciating stable collateral and ignore wbtc', async () => {
       await token0.setExchangeRate(fp('1.1')) // 10% appreciation
-      await expect(backingManager.manageTokens([token0.address])).to.not.emit(
-        backingManager,
-        'TradeStarted'
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.revertedWith(
+        'already collateralized'
       )
+      await backingManager.forwardRevenue([wbtc.address, token0.address])
       expect(await wbtc.balanceOf(rTokenTrader.address)).to.equal(0)
       expect(await wbtc.balanceOf(rsrTrader.address)).to.equal(0)
-      await expect(rTokenTrader.manageToken(wbtc.address)).to.not.emit(rTokenTrader, 'TradeStarted')
-      await expect(rTokenTrader.manageToken(token0.address)).to.emit(rTokenTrader, 'TradeStarted')
+      await expect(
+        rTokenTrader.manageTokens([wbtc.address], [TradeKind.BATCH_AUCTION])
+      ).to.be.revertedWith('0 balance')
+      await expect(rTokenTrader.manageTokens([token0.address], [TradeKind.BATCH_AUCTION])).to.emit(
+        rTokenTrader,
+        'TradeStarted'
+      )
 
       // RTokenTrader should be selling token0 and buying RToken
       const trade = await getTrade(rTokenTrader, token0.address)
       expect(await trade.sell()).to.equal(token0.address)
       expect(await trade.buy()).to.equal(rToken.address)
 
-      await expect(rsrTrader.manageToken(wbtc.address)).to.not.emit(rsrTrader, 'TradeStarted')
-      await expect(rsrTrader.manageToken(token0.address)).to.emit(rsrTrader, 'TradeStarted')
+      await expect(
+        rsrTrader.manageTokens([wbtc.address], [TradeKind.BATCH_AUCTION])
+      ).to.be.revertedWith('0 balance')
+      await expect(rsrTrader.manageTokens([token0.address], [TradeKind.BATCH_AUCTION])).to.emit(
+        rsrTrader,
+        'TradeStarted'
+      )
 
       // RSRTrader should be selling token0 and buying RToken
       const trade2 = await getTrade(rsrTrader, token0.address)
@@ -195,7 +207,11 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
     it('should change basket around wbtc', async () => {
       await token0.setExchangeRate(fp('0.99')) // default
       await basketHandler.refreshBasket()
-      await expect(backingManager.manageTokens([token0.address, wbtc.address])).to.emit(
+
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.emit(
         backingManager,
         'TradeStarted'
       )
@@ -213,7 +229,7 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
     it('should calculate price correctly', async () => {
       await referenceUnitOracle.updateAnswer(bn('0.95e8')) // 5% below peg
       await targetUnitOracle.updateAnswer(bn('100000e8')) // $100k
-      expect(await wbtcCollateral.price()).to.equal(fp('95000'))
+      await expectPrice(wbtcCollateral.address, fp('95000'), ORACLE_ERROR, true)
     })
 
     it('should redeem after BTC price increase for same quantities', async () => {
@@ -231,17 +247,19 @@ describe(`Non-fiat collateral (eg WBTC) - P${IMPLEMENTATION}`, () => {
       await targetUnitOracle.updateAnswer(bn('10000e8'))
       await assetRegistry.refresh()
 
-      // Should be fully capitalized
+      // Should be fully collateralized
       expect(await basketHandler.fullyCollateralized()).to.equal(true)
       expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
-      expect(await basketHandler.basketsHeldBy(backingManager.address)).to.equal(issueAmt)
+      expect(await facadeTest.wholeBasketsHeldBy(rToken.address, backingManager.address)).to.equal(
+        issueAmt
+      )
     })
 
     it('should be able to deregister', async () => {
       await assetRegistry.connect(owner).unregister(wbtcCollateral.address)
       await basketHandler.refreshBasket()
 
-      // Should be in an undercapitalized state but SOUND
+      // Should be in an undercollateralized state but SOUND
       expect(await basketHandler.fullyCollateralized()).to.equal(false)
       expect(await basketHandler.status()).to.equal(CollateralStatus.DISABLED)
     })

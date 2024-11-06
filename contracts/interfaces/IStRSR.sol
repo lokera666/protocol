@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/IERC20MetadataUpgradeable.sol";
 // solhint-disable-next-line max-line-length
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/draft-IERC20PermitUpgradeable.sol";
-import "contracts/libraries/Fixed.sol";
+import "../libraries/Fixed.sol";
 import "./IComponent.sol";
-import "./IMain.sol";
 
 /**
  * @title IStRSR
- * @notice An ERC20 token representing shares of the RSR insurance pool.
+ * @notice An ERC20 token representing shares of the RSR over-collateralization pool.
  *
  * StRSR permits the BackingManager to take RSR in times of need. In return, the BackingManager
  * benefits the StRSR pool with RSR rewards purchased with a portion of its revenue.
@@ -29,7 +28,7 @@ interface IStRSR is IERC20MetadataUpgradeable, IERC20PermitUpgradeable, ICompone
         uint256 indexed era,
         address indexed staker,
         uint256 rsrAmount,
-        uint256 indexed stRSRAmount
+        uint256 stRSRAmount
     );
 
     /// Emitted when an unstaking is started
@@ -65,20 +64,37 @@ interface IStRSR is IERC20MetadataUpgradeable, IERC20PermitUpgradeable, ICompone
         uint256 rsrAmount
     );
 
+    /// Emitted when RSR unstaking is cancelled
+    /// @param firstId The beginning of the range of draft IDs withdrawn in this transaction
+    /// @param endId The end of range of draft IDs withdrawn in this transaction
+    ///   (ID i was withdrawn if firstId <= i < endId)
+    /// @param draftEra The era of the draft.
+    ///   The triple (staker, draftEra, id) is a unique ID among drafts
+    /// @param staker The address of the unstaker
+
+    /// @param rsrAmount {qRSR} How much RSR this unstaking was worth
+    event UnstakingCancelled(
+        uint256 indexed firstId,
+        uint256 indexed endId,
+        uint256 draftEra,
+        address indexed staker,
+        uint256 rsrAmount
+    );
+
     /// Emitted whenever the exchange rate changes
-    event ExchangeRateSet(uint192 indexed oldVal, uint192 indexed newVal);
+    event ExchangeRateSet(uint192 oldVal, uint192 newVal);
 
     /// Emitted whenever RSR are paids out
-    event RewardsPaid(uint256 indexed rsrAmt);
+    event RewardsPaid(uint256 rsrAmt);
 
     /// Emitted if all the RSR in the staking pool is seized and all balances are reset to zero.
     event AllBalancesReset(uint256 indexed newEra);
     /// Emitted if all the RSR in the unstakin pool is seized, and all ongoing unstaking is voided.
     event AllUnstakingReset(uint256 indexed newEra);
 
-    event UnstakingDelaySet(uint48 indexed oldVal, uint48 indexed newVal);
-    event RewardPeriodSet(uint48 indexed oldVal, uint48 indexed newVal);
-    event RewardRatioSet(uint192 indexed oldVal, uint192 indexed newVal);
+    event UnstakingDelaySet(uint48 oldVal, uint48 newVal);
+    event RewardRatioSet(uint192 oldVal, uint192 newVal);
+    event WithdrawalLeakSet(uint192 oldVal, uint192 newVal);
 
     // Initialization
     function init(
@@ -86,15 +102,16 @@ interface IStRSR is IERC20MetadataUpgradeable, IERC20PermitUpgradeable, ICompone
         string memory name_,
         string memory symbol_,
         uint48 unstakingDelay_,
-        uint48 rewardPeriod_,
-        uint192 rewardRatio_
+        uint192 rewardRatio_,
+        uint192 withdrawalLeak_
     ) external;
 
     /// Gather and payout rewards from rsrTrader
     /// @custom:interaction
     function payoutRewards() external;
 
-    /// Stakes an RSR `amount` on the corresponding RToken to earn yield and insure the system
+    /// Stakes an RSR `amount` on the corresponding RToken to earn yield and over-collateralized
+    /// the system
     /// @param amount {qRSR}
     /// @custom:interaction
     function stake(uint256 amount) external;
@@ -108,22 +125,26 @@ interface IStRSR is IERC20MetadataUpgradeable, IERC20PermitUpgradeable, ICompone
     /// @custom:interaction
     function withdraw(address account, uint256 endId) external;
 
+    /// Cancel unstaking for the account, up to (but not including!) `endId`
+    /// @custom:interaction
+    function cancelUnstake(uint256 endId) external;
+
     /// Seize RSR, only callable by main.backingManager()
     /// @custom:protected
     function seizeRSR(uint256 amount) external;
 
+    /// Reset all stakes and advance era
+    /// @custom:governance
+    function resetStakes() external;
+
     /// Return the maximum valid value of endId such that withdraw(endId) should immediately work
     function endIdForWithdraw(address account) external view returns (uint256 endId);
 
-    /// @return {qStRSR/qRSR} The exchange rate between StRSR and RSR
+    /// @return {qRSR/qStRSR} The exchange rate between RSR and StRSR
     function exchangeRate() external view returns (uint192);
 }
 
 interface TestIStRSR is IStRSR {
-    function rewardPeriod() external view returns (uint48);
-
-    function setRewardPeriod(uint48) external;
-
     function rewardRatio() external view returns (uint192);
 
     function setRewardRatio(uint192) external;
@@ -132,9 +153,9 @@ interface TestIStRSR is IStRSR {
 
     function setUnstakingDelay(uint48) external;
 
-    function setName(string calldata) external;
+    function withdrawalLeak() external view returns (uint192);
 
-    function setSymbol(string calldata) external;
+    function setWithdrawalLeak(uint192) external;
 
     function increaseAllowance(address, uint256) external returns (bool);
 

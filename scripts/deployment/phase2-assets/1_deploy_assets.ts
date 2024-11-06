@@ -1,18 +1,17 @@
 import fs from 'fs'
-import hre from 'hardhat'
+import hre, { ethers } from 'hardhat'
 import { getChainId } from '../../../common/blockchain-utils'
-import { networkConfig } from '../../../common/configuration'
-import { ZERO_ADDRESS } from '../../../common/constants'
+import { arbitrumL2Chains, baseL2Chains, networkConfig } from '../../../common/configuration'
 import { fp } from '../../../common/numbers'
 import {
   getDeploymentFile,
   getDeploymentFilename,
   getAssetCollDeploymentFilename,
   IAssetCollDeployments,
-  IDeployments,
   fileExists,
 } from '../../deployment/common'
-import { getOracleTimeout } from '../../deployment/utils'
+import { priceTimeout } from '../../deployment/utils'
+import { Asset } from '../../../typechain'
 
 async function main() {
   // ==== Read Configuration ====
@@ -31,8 +30,6 @@ async function main() {
   if (!fileExists(phase1File)) {
     throw new Error(`${phase1File} doesn't exist yet. Run phase 1`)
   }
-  const phase1Deployment = <IDeployments>getDeploymentFile(phase1File)
-
   // Check previous step completed
   const assetCollDeploymentFilename = getAssetCollDeploymentFilename(chainId)
   const assetCollDeployments = <IAssetCollDeployments>getDeploymentFile(assetCollDeploymentFilename)
@@ -40,35 +37,37 @@ async function main() {
   const deployedAssets: string[] = []
 
   /********  Deploy StkAAVE Asset **************************/
-  const { asset: stkAAVEAsset } = await hre.run('deploy-asset', {
-    priceFeed: networkConfig[chainId].chainlinkFeeds.AAVE,
-    tokenAddress: networkConfig[chainId].tokens.stkAAVE,
-    rewardToken: ZERO_ADDRESS,
-    tradingValMin: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-    tradingValMax: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-    tradingAmtMin: fp(chainId == 1 ? '10' : '1').toString(), // 10 StkAAVE
-    tradingAmtMax: fp(chainId == 1 ? '1e4' : '1e9').toString(), // 10,000 StkAAVE
-    oracleTimeout: getOracleTimeout(chainId).toString(),
-    oracleLib: phase1Deployment.oracleLib,
-  })
+  if (!baseL2Chains.includes(hre.network.name) && !arbitrumL2Chains.includes(hre.network.name)) {
+    const { asset: stkAAVEAsset } = await hre.run('deploy-asset', {
+      priceTimeout: priceTimeout.toString(),
+      priceFeed: networkConfig[chainId].chainlinkFeeds.AAVE,
+      oracleError: fp('0.01').toString(), // 1%
+      tokenAddress: networkConfig[chainId].tokens.stkAAVE,
+      maxTradeVolume: fp('1e6').toString(), // $1m,
+      oracleTimeout: '3600', // 1 hr
+    })
+    await (<Asset>await ethers.getContractAt('Asset', stkAAVEAsset)).refresh()
 
-  assetCollDeployments.assets.stkAAVE = stkAAVEAsset
-  deployedAssets.push(stkAAVEAsset.toString())
+    assetCollDeployments.assets.stkAAVE = stkAAVEAsset
+    assetCollDeployments.erc20s.stkAAVE = networkConfig[chainId].tokens.stkAAVE
+    deployedAssets.push(stkAAVEAsset.toString())
+  }
+
+  const oracleError = arbitrumL2Chains.includes(hre.network.name) ? fp('0.005') : fp('0.01')
 
   /********  Deploy Comp Asset **************************/
   const { asset: compAsset } = await hre.run('deploy-asset', {
+    priceTimeout: priceTimeout.toString(),
     priceFeed: networkConfig[chainId].chainlinkFeeds.COMP,
+    oracleError: oracleError.toString(), // 1%
     tokenAddress: networkConfig[chainId].tokens.COMP,
-    rewardToken: ZERO_ADDRESS,
-    tradingValMin: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-    tradingValMax: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-    tradingAmtMin: fp(chainId == 1 ? '20' : '1').toString(), // // 20 COMP
-    tradingAmtMax: fp(chainId == 1 ? '2e4' : '1e9').toString(), // 20,000 COMP
-    oracleTimeout: getOracleTimeout(chainId).toString(),
-    oracleLib: phase1Deployment.oracleLib,
+    maxTradeVolume: fp('1e6').toString(), // $1m,
+    oracleTimeout: '3600', // 1 hr
   })
+  await (<Asset>await ethers.getContractAt('Asset', compAsset)).refresh()
 
   assetCollDeployments.assets.COMP = compAsset
+  assetCollDeployments.erc20s.COMP = networkConfig[chainId].tokens.COMP
   deployedAssets.push(compAsset.toString())
 
   /**************************************************************/

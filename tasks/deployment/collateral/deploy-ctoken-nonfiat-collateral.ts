@@ -1,62 +1,46 @@
 import { getChainId } from '../../../common/blockchain-utils'
 import { task } from 'hardhat/config'
-import { CTokenNonFiatCollateral, CTokenMock, ERC20Mock } from '../../../typechain'
+import { CTokenNonFiatCollateral } from '../../../typechain'
 
 task('deploy-ctoken-nonfiat-collateral', 'Deploys a CToken Non-Fiat Collateral')
+  .addParam('priceTimeout', 'The amount of time before a price decays to 0')
   .addParam('referenceUnitFeed', 'Reference Price Feed address')
   .addParam('targetUnitFeed', 'Target Unit Price Feed address')
+  .addParam('combinedOracleError', 'The combined % error from both oracle sources')
   .addParam('cToken', 'CToken address')
-  .addParam('rewardToken', 'Reward token address')
-  .addParam('tradingValMin', 'Trade Range - Min in UoA')
-  .addParam('tradingValMax', 'Trade Range - Max in UoA')
-  .addParam('tradingAmtMin', 'Trade Range - Min in whole toks')
-  .addParam('tradingAmtMax', 'Trade Range - Max in whole toks')
-  .addParam('oracleTimeout', 'Max oracle timeout')
+  .addParam('maxTradeVolume', 'Max Trade Volume (in UoA)')
+  .addParam('oracleTimeout', 'Max oracle timeout for the reference unit feed')
+  .addParam('targetUnitOracleTimeout', 'Max oracle timeout for the target unit feed')
   .addParam('targetName', 'Target Name')
   .addParam('defaultThreshold', 'Default Threshold')
   .addParam('delayUntilDefault', 'Delay until default')
-  .addParam('oracleLib', 'Oracle library address')
+  .addParam('revenueHiding', 'Revenue Hiding')
   .setAction(async (params, hre) => {
     const [deployer] = await hre.ethers.getSigners()
 
     const chainId = await getChainId(hre)
 
-    // Get CToken to retrieve underlying
-    const cToken: CTokenMock = <CTokenMock>(
-      await hre.ethers.getContractAt('CTokenMock', params.cToken)
-    )
-
-    // Get Underlying
-    const erc20: ERC20Mock = <ERC20Mock>(
-      await hre.ethers.getContractAt('ERC20Mock', await cToken.underlying())
-    )
-
     const CTokenNonFiatCollateralFactory = await hre.ethers.getContractFactory(
-      'CTokenNonFiatCollateral',
-      {
-        libraries: { OracleLib: params.oracleLib },
-      }
+      'CTokenNonFiatCollateral'
     )
 
     const collateral = <CTokenNonFiatCollateral>await CTokenNonFiatCollateralFactory.connect(
       deployer
     ).deploy(
-      params.referenceUnitFeed,
-      params.targetUnitFeed,
-      params.cToken,
-      params.rewardToken,
       {
-        minVal: params.tradingValMin,
-        maxVal: params.tradingValMax,
-        minAmt: params.tradingAmtMin,
-        maxAmt: params.tradingAmtMax,
+        priceTimeout: params.priceTimeout,
+        chainlinkFeed: params.referenceUnitFeed,
+        oracleError: params.combinedOracleError,
+        erc20: params.cToken,
+        maxTradeVolume: params.maxTradeVolume,
+        oracleTimeout: params.oracleTimeout,
+        targetName: params.targetName,
+        defaultThreshold: params.defaultThreshold,
+        delayUntilDefault: params.delayUntilDefault,
       },
-      params.oracleTimeout,
-      params.targetName,
-      params.defaultThreshold,
-      params.delayUntilDefault,
-      await erc20.decimals(), // Reference ERC20 decimals
-      params.comptroller
+      params.targetUnitFeed,
+      params.targetUnitOracleTimeout,
+      params.revenueHiding
     )
     await collateral.deployed()
 

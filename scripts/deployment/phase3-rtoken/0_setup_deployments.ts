@@ -3,7 +3,7 @@ import hre from 'hardhat'
 
 import { getChainId, isValidContract } from '../../../common/blockchain-utils'
 import { networkConfig } from '../../../common/configuration'
-import { getRTokenConfig } from './rTokenConfig'
+import { getRTokenConfig, RTOKEN_NAME } from './rTokenConfig'
 import {
   fileExists,
   getDeploymentFile,
@@ -13,9 +13,6 @@ import {
   IRTokenDeployments,
 } from '../common'
 import { validatePrerequisites } from '../utils'
-
-// Define the Token to deploy - Will create deployment file
-const RTOKEN_NAME = 'RTKN'
 
 async function main() {
   // ==== Read Configuration ====
@@ -34,7 +31,7 @@ async function main() {
 
   // Check if deployment file already exists for this chainId
   const rTokenDeploymentFilename = getRTokenDeploymentFilename(chainId, RTOKEN_NAME)
-  if (fileExists(rTokenDeploymentFilename)) {
+  if (chainId != '31337' && fileExists(rTokenDeploymentFilename)) {
     throw new Error(`${rTokenDeploymentFilename} exists; I won't overwrite it.`)
   }
 

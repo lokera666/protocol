@@ -4,44 +4,38 @@ import { ContractFactory } from 'ethers'
 import { ATokenFiatCollateral } from '../../../typechain'
 
 task('deploy-atoken-fiat-collateral', 'Deploys an AToken Fiat Collateral')
+  .addParam('priceTimeout', 'The amount of time before a price decays to 0')
   .addParam('priceFeed', 'Price Feed address')
+  .addParam('oracleError', 'The % error in the price feed as a fix')
   .addParam('staticAToken', 'Static AToken address')
-  .addParam('rewardToken', 'Reward token address')
-  .addParam('tradingValMin', 'Trade Range - Min in UoA')
-  .addParam('tradingValMax', 'Trade Range - Max in UoA')
-  .addParam('tradingAmtMin', 'Trade Range - Min in whole toks')
-  .addParam('tradingAmtMax', 'Trade Range - Max in whole toks')
+  .addParam('maxTradeVolume', 'Max Trade Volume (in UoA)')
   .addParam('oracleTimeout', 'Max oracle timeout')
   .addParam('targetName', 'Target Name')
   .addParam('defaultThreshold', 'Default Threshold')
   .addParam('delayUntilDefault', 'Delay until default')
-  .addParam('oracleLib', 'Oracle library address')
+  .addParam('revenueHiding', 'Revenue Hiding')
   .setAction(async (params, hre) => {
     const [deployer] = await hre.ethers.getSigners()
 
     const chainId = await getChainId(hre)
 
     const ATokenCollateralFactory: ContractFactory = await hre.ethers.getContractFactory(
-      'ATokenFiatCollateral',
-      {
-        libraries: { OracleLib: params.oracleLib },
-      }
+      'ATokenFiatCollateral'
     )
 
     const collateral = <ATokenFiatCollateral>await ATokenCollateralFactory.connect(deployer).deploy(
-      params.priceFeed,
-      params.staticAToken,
-      params.rewardToken,
       {
-        minVal: params.tradingValMin,
-        maxVal: params.tradingValMax,
-        minAmt: params.tradingAmtMin,
-        maxAmt: params.tradingAmtMax,
+        priceTimeout: params.priceTimeout,
+        chainlinkFeed: params.priceFeed,
+        oracleError: params.oracleError,
+        erc20: params.staticAToken,
+        maxTradeVolume: params.maxTradeVolume,
+        oracleTimeout: params.oracleTimeout,
+        targetName: params.targetName,
+        defaultThreshold: params.defaultThreshold,
+        delayUntilDefault: params.delayUntilDefault,
       },
-      params.oracleTimeout,
-      params.targetName,
-      params.defaultThreshold,
-      params.delayUntilDefault
+      params.revenueHiding
     )
     await collateral.deployed()
 

@@ -12,7 +12,7 @@ Any ERC20 token that our system knows how to deal with is wrapped and modelled i
 
 The remained solidity files in our repository are either:
 
-- `Facade.sol` and, which is a stateless generic interface that can be used with any RToken. This enables convenient external interactions and app development. There can be multiple facades.
+- `Facade.sol` and `FacadeAct.sol`, which is a stateless generic interface that can be used with any RToken. This enables convenient external interactions and app development. There can be multiple facades.
 - `FacadeWrite.sol`, which allows to easily deploy and configure an RToken in a few simple transactions.
 - `Deployer.sol`, which deploys the clones of implementation contracts as needed to initialize a new RToken
 - `Fixed.sol`, which provides fixed-point fractional arithmetic operations
@@ -33,9 +33,8 @@ Some of the core contracts in our system regularly own ERC20 tokens. In each cas
 
 ### RToken Lifecycle
 
-1. During SlowIssuance, the `RToken` transfers collateral tokens from the issuer's address into itself.
-2. At vesting time, the `RToken` contract mints new RToken to the issuer and transfers the held collateral to the `BackingManager`. If the `BasketHandler` has updated the basket since issuance began, then the collateral is instead returned to the user and no RToken is minted.
-3. During redemption, RToken is burnt from the redeemer's account and they are transferred a prorata share of backing collateral from the `BackingManager`.
+1. During minting, the `RToken` transfers collateral tokens from the caller's address into itself and mints new RToken to the caller's address. Minting amount must be less than the current throttle limit, or the transaction will revert.
+2. During redemption, RToken is burnt from the redeemer's account and they are transferred a prorata share of backing collateral from the `BackingManager`.
 
 ## Some Monetary Units
 
@@ -45,19 +44,26 @@ Some units:
 
 - Unit of Account `{UoA}`: Any particular RToken must have a single Unit of Account. This unit is used internally to compare the values of different assets, as when deciding when there's enough revenue to start an auction, or in which of several surplus assets we hold the largest surplus.
 
-- Target unit `{target}`: Outside of default, each collateral in an RToken basket is expected to be stable or appreciating against some exogenous currency. The exogenous currency is that collateral's _target unit_. We expect that in many RTokens that people actually want, all of those target units will be the same, and we can speak of the RToken maintaining stability or appreciation against _its_ target unit.
+- Target unit `{target}`: Outside of default, each collateral in an RToken basket is expected to be stable or appreciating against some exogenous unit. The exogenous unit is that collateral's _target unit_. We expect that in many RTokens that people actually want, many of the target units will be the same, and we can speak of the RToken maintaining stability or appreciation against a linear combination of target units.
 
 - Reference unit `{ref}`: When collateral tokens are expected to appreciate, it's generally because some defi protocol (or protocols) produces a token that is freely redeemable for some base token, and that redemption rate is expected to monotonically increase over time. That base token is the _reference unit_ for the collateral token. The RToken protocol expects reference units to be in a known, predictable relationship with target units, and will flag a collateral token as defaulting if that relationship appears to be broken.
 
 - Token `{tok}`: A token that our protocol holds a balance of, mostly as backing for the RToken.
 
-A couple examples:
+Some examples:
 
-- In the USD+ RToken we have designed, the unit of account is USD. Among others, cUSDC is a collateral token with reference unit USDC and target unit USD, and aUSDP is a collateral token with reference token USDP and target unit USD.
+- For a Compound collateral token such as cUSDC, the unit of account is USD, the reference unit USDC and target unit USD.
+- For an Aave collateral token such as aUSDP, the unit of account is USD, the reference token USDP and target unit USD.
 
 - Let's say we're building a pure-stable USD basket, out of USDC, USDP, and DAI. The unit of account would surely be USD. Each collateral token would also be its own reference unit, and its target would be USD.
 
+- Perhaps we're interested in a USD-denominated basket of blue-chip cryptocurrencies. This type of rToken could be a 50/50 basket of wstETH and yvwBTC, where the reference units could be ETH and wBTC, respectively. The target units would then be ETH & BTC, while the `{UoA}` would be USD. Thus, the _value_ of the rToken would fluctuate (according to its unit-of-account), but all other necessary properties could be maintained.
+
 Separate from these, a number in dimension `{BU}` ("basket units") is an amount of current baskets.
+
+### Regarding `{UoA}` and `{target}`
+
+While it will usually be the case that a collateral's `{target}` will be the same as its RToken's `{UoA}`, this is by no means a requirement. The `{UoA}` is a way to value the RToken and its collateral in terms of a single unit, while each collateral's `{target}` is the expected value of its liability, or its `{ref}`. As in example #3 above, an RToken's collaterals may have completely different `{target}` units, but be valued by the same `{UoA}`.
 
 ## Basket Dynamics
 
@@ -95,16 +101,17 @@ The dimension of `token amount` is `{tok/BU}`.
 
 For instance, if the reference basket contains the pair `<cUSDC, O.29>`, then one basket unit will contain 0.29 cUSDC.
 
-This is the form of the basket that issuers and redeemer will care most about. Issuance and redemption quantities are given by the collateral basket times the current `rTok/BU` exchange rate.
+This is the form of the basket that recipients and redeemer will care most about. Issuance and redemption quantities are given by the collateral basket times the current `rTok/BU` exchange rate.
 
-While an issuance is pending in the mempool, the quantities of tokens that will be ingested when the transaciton is mined may decrease slightly as the collateral becomes worth more. If furnace melting happens in that time, however, this can increase the quantity of collateral tokens in the basket and cause the issuance to fail.
+While an issuance is pending in the mempool, the quantities of tokens that will be ingested when the transaction is mined may decrease slightly as the collateral becomes worth more. If furnace melting happens in that time, however, this can increase the quantity of collateral tokens in the basket and cause the issuance to fail.
 
 On the other hand, while a redemption is pending in the mempool, the quantities of collateral tokens the redeemer will receive steadily decreases. If a furnace melting happens in that time the quantities will be increased, causing the redeemer to get more than they expected.
 
 ## System States
 
-- `paused`: all interactions disabled EXCEPT RToken.redeem + RToken.cancel + ERC20 functions + StRSR.stake
-- `frozen`: all interactions disabled EXCEPT ERC20 functions + StRSR.stake
+- `tradingPaused`: all interactions disabled EXCEPT ERC20 functions + RToken.issue + RToken.redeem + StRSR.stake + StRSR.payoutRewards
+- `issuancePaused`: all interactions enabled EXCEPT RToken.issue
+- `frozen`: all interactions disabled EXCEPT ERC20 functions + StRSR.stake + StRSR.payoutRewards
 
 Freezing can occur over two timescales: short freezing + long freezing.
 
@@ -117,177 +124,200 @@ Non-owner roles:
 Design intentions:
 
 - The PAUSER role should be assigned to an address that is able to act quickly in response to off-chain events, such as a Chainlink feed failing. It is acceptable for there to be false positives, since redemption remains enabled.
-- The SHORT_FREEZER role should be assigned to an address that might reasonably be expected to be the first to detect a bug in the code and can act quickly, and with some tolerance for false positives though less than in pausing. If a bug is detected, a short freeze can be triggered which will automatically expire if it is not renewed by LONG_FREEZER. The OWNER (governance) may also step in and unfreeze at anytime.
+- The SHORT_FREEZER role should be assigned to an address that might reasonably be expected to be the first to detect a bug in the code and can act quickly, and with some tolerance for false positives though less than in pausing. If a bug is detected, a short freeze can be triggered which will automatically expire if it is not renewed by LONG_FREEZER. The OWNER (governance) may also step in and unfreeze at any time.
 - The LONG_FREEZER role should be assigned to an address that will highly optimize for no false positives. It is much longer than the short freeze. It exists so that in the case of a zero-day exploit, governance can act before the system unfreezes and resumes functioning.
 
-## Deployment Parameters
-
-### `dist` (revenue split)
-
-The fraction of revenues that should go towards RToken holders vs stakers, as given by the relative values of `dist.rTokenDist` and `dist.rsrDist`. This can be thought of as a single variable between 0 and 100% (during deployment).
-
-Anticipated value: 60% to stakers and 40% to RToken holders.
-Mainnet reasonable range: 0% to 100%
-
-### `rTokenTradingRange.minVal`
-
-Dimension: `{UoA}`
-
-The min of the RToken trading range in terms of the unit of account. As long as the RToken remains priceable, no trades involving RToken can occur below this trade size. Note that both tokens contribute to trade sizing in any given trade.
-
-This parameter can be set to zero.
-
-Anticipated value: `1e22` = $10k
-Mainnet reasonable range: 1e21 to 1e27.
-
-### `rTokenTradingRange.maxVal`
-
-Dimension: `{UoA}`
-
-The max of the RToken trading range in terms of the unit of account. As long as the RToken remains priceable, no trades involving RToken can occur above this trade size.
-
-This parameter can be set to zero.
-
-Anticipated value: `1e24` = $1M
-Mainnet reasonable range: 1e22 to 1e27.
-
-### `rTokenTradingRange.minAmt`
-
-Dimension: `{qRTok}`
-
-The min of the RToken trading range in terms of RToken token quantities. This limit cannot be set to 0 and is always enforced --- even at the same time as the UoA limits --- and even when the RToken becomes UNPRICEABLE.
-
-Since token prices can change quickly in short periods of time, it is recommended to set these generously. In general the UoA limits should be tighter than the qRTok limits.
-
-Anticipated value: `1e21` = 1000 RToken
-Mainnet reasonable range: 1e20 to 1e24.
-
-### `rTokenTradingRange.maxAmt`
-
-Dimension: `{qRTok}`
-
-The max of the RToken trading range in terms of RToken token quantities. This limit cannot be set to 0 and is always enforced --- even at the same time as the UoA limits --- and even when the RToken becomes UNPRICEABLE.
-
-Anticipated value: `1e25` = 10M RToken
-Mainnet reasonable range: 1e21 to 1e27.
-
-### `rewardPeriod`
-
-Dimension: `{seconds}`
-
-The reward period is the length of one period of the StRSR and Furnace reward curves, which use exponential decay in order to hand out rewards slowly. The `rewardPeriod` must be set in conjuction with `rewardRatio` in order to achieve a desired payout rate. The `rewardPeriod` is the length of time that comprises a single period. Over a single period, `rewardRatio` of the last balance recorded is handed out. For multiple periods, the amount handed out is `(1 - (1-r)^N)`, where `r` is the `rewardRatio` and `N` is the number of periods elapsed.
-
-Anticipated value: `86400` = 1 day
-Mainnet reasonable range: 10 to 31536000 (1 year)
-
-### `rewardRatio`
-
-Dimension: `{1}`
-
-The `rewardRatio` is the amount of the current reward amount that should be handed out in a single period. See above.
-
-Anticipated value: `0.007701635339554948` = half life of 90 periods
-Mainnet reasonable range: 1e9 to 1e18
-
-### `unstakingDelay`
-
-Dimension: `{seconds}`
-
-The unstaking delay is the number of seconds that all RSR unstakings must be delayed in order to account for stakers trying to frontrun defaults. It must be longer than governance cycle, and must be long enough that RSR stakers do not unstake in advance of foreseeable basket change.
-
-Anticipated value: `1209600` = 2 weeks
-Mainnet reasonable range: 1 to 31536000
-
-### `tradingDelay`
-
-Dimension: `{seconds}`
-
-The trading delay is how many seconds should pass after the basket has been changed, before a trade is opened. In the long term this can probably trend towards zero, but at the start we will want some heads up before trading in order to avoid losses due to poor liquidity.
-
-Anticipated value: `14400` = 4 hours
-Mainnet reasonable range: 0 to 604800
-
-### `auctionLength`
-
-Dimension: `{seconds}`
-
-The auction length is how many seconds long Gnosis EasyAuctions should be.
-
-Anticipated value: `900` = 15 minutes
-Mainnet reasonable range: 60 to 3600
-
-### `backingBuffer`
-
-Dimension: `{1}`
-
-The backing buffer is a percentage value that describes how much additional collateral tokens to keep in the BackingManager before forwarding tokens to the RevenueTraders. This helps cause collateral tokens to more reliably be converted into RToken, which is the most efficient form of revenue production.
-
-Anticipated value: `1e14` = 0.01%
-Mainnet reasonable range: 1e12 to 1e18
-
-### `maxTradeSlippage`
-
-Dimension: `{1}`
-
-The max trade slippage is a percentage value that describes the maximum deviation from oracle prices that any trade can clear at.
-
-Anticipated value: `0.01e18` = 1%
-Mainnet reasonable range: 1e12 to 1e18
-
-### `shortFreeze`
-
-Dimension: `{s}`
-
-The number of seconds an initial freeze lasts. Governance can freeze forever.
-
-Anticipated value: `259200` = 3 days
-Mainnet reasonable range: 3600 to 2592000 (1 hour to 1 month)
-
-### `longFreeze`
-
-Dimension: `{s}`
-
-The number of seconds a freeze extensions freeze lasts. A long freeze / extension can only occur during a short freeze.
-
-Anticipated value: `2592000` = 30 days
-Mainnet reasonable range: 86400 to 31536000 (1 day to 1 year)
-
-### `issuanceRate`
-
-Dimension: `{1}`
-
-The issuance rate is a percentage value that describes what proportion of the RToken supply to issue per block. It controls how quickly the protocol can scale up RToken supply.
-
-Anticipated value: `0.00025e18` = 0.025% per block
-Mainnet reasonable range: 1e12 to 1e16
-
-### `maxRedemptionCharge`
-
-Dimension: `{1}`
-
-The max redemption is a percentage value that describes what proportion of the RToken supply to allow redemption of per-hour. It controls how quickly the protocol can scale down RToken supply.
-
-Set to 0 to disable redemption throttling altogether.
-
-Anticipated value: `5e16` = 5% per hour
-Mainnet reasonable range: 1e15 to 1e18 (0.1% per hour to 100% per hour; or disable and set to 0)
-
-### `redemptionVirtualSupply`
-
-Dimension: `{qRTok}`
-
-The redemption virtual supply is the minimum value to use to size the redemption battery. The redemption capacity is at least maxRedemptionCharge \* redemptionVirtualSupply.
-
-Anticipated value: `2e25` = $20,000,000 at $1 an RToken
-Mainnet reasonable range: 1e21 to 1e27
-
-### Governance Parameters
-
-Governance is 7 days end-to-end.
-
-- Voting delay: 1 day
-- Voting period: 2 days
-- Execution delay: 4 days
-
-Proposal Threshold: 0.05%
-Quorum: 10%
+## System Auctions
+
+The Reserve Protocol makes a few different types of trades:
+
+- from collateral to RSR or RToken, in order to distribute collateral yields. These happen often in a RevenueTrader.
+- from reward tokens to RSR or RToken, in order to distribute tokens rewards from collateral. These also happen often in a RevenueTrader.
+- collateral to collateral, in order to change the distribution of collateral due to a basket change. Basket changes should be rare, happening only when governance changes the basket, or when some collateral token defaults. This only happens in the BackingManager.
+- RSR to collateral, in order to recollateralize the protocol from stRSR over-collateralization, after a basket change. These auctions should be even rarer, happening when there's a basket change and insufficient capital to achieve recollateralization without using the over-collateralization buffer. These auctions also happen in the BackingManager.
+
+Each type of trade can happen two ways: either by a falling-price dutch auction (DutchTrade) or by a batch auction via Gnosis EasyAuction (GnosisTrade). More trading methods can be added in the future.
+
+### Gnosis EasyAuction Batch Auctions (GnosisTrade)
+
+A good explainer for how Gnosis auctions work can be found (on their github)[https://github.com/gnosis/ido-contracts].
+
+### Dutch Auctions (DutchTrade)
+
+The Dutch auction occurs in two phases:
+
+Geometric/Exponential Phase (first 40% of auction): The price starts at about 1000x the best plausible price and decays down to the best plausible price following a geometric/exponential series. The price decreases by the same percentage each time. This phase is primarily defensive, and it's not expected to receive a bid; it merely protects against manipulated prices.
+
+Linear Phase (last 60% of auction): During this phase, the price decreases linearly from the best plausible price to the worst plausible price.
+
+The `dutchAuctionLength` can be configured to be any value. The suggested default is 30 minutes for a blockchain with a 12-second blocktime. At this ratio of blocktime to auction length, there is a 10.87% price drop per block during the geometric/exponential period and a 0.05% drop during the linear period. The duration of the auction can be adjusted, which will impact the size of the price decreases per block.
+
+The "best plausible price" is equal to the exchange rate at the high price of the sell token and the low price of the buy token. The "worst-case price" is equal to the exchange rate at the low price of the sell token and the high price of the sell token, plus an additional discount equal to `maxTradeSlippage`.
+
+#### Trade violation fallback
+
+Dutch auctions become disabled for an asset being traded if a trade clears in the geometric phase. The rationale is that a trade that clears in this range (multiples above the plausible price) only does so because either 1) the auctioned asset's price was manipulated downwards, or 2) the bidding asset was manipulated upwards, such that the protocol accepts an unfavorable trade. All subsequent trades for that particular trading pair will be forced to use the batch auctions as a result. Dutch auctions for disabled assets must be manually re-enabled by governance.
+
+Take for example the scenario of an RToken basket change requiring a trade of 5M USDC for 5M USDT, where the `maxTradeSize` is $1M (therefore requiring at least 5 auctions). If the system's price inputs for USDC was manipulated to read a price of $0.001/USDC, settling the auction in the geometric phase at any multiple less than 1000x will yield a profit for the trader, at a cost to the RToken system. Accordingly, Dutch auctions become disabled for the subsequent trades to swap USDC to USDT.
+
+Dutch auctions for other assets that have not cleared in the geometric zone will remain enabled.
+
+#### Sample price curve
+
+This price curve is for two assets with 1% oracleError, and with a 1% maxTradeSlippage, during a 30-minute auction. The token has 6 decimals and the "even price" occurs at 100,000,000. The phase changes between different portions of the auction are shown with `============` dividers.
+
+```
+BigNumber { value: "102020210210" }
+BigNumber { value: "82140223099" }
+BigNumber { value: "66134114376" }
+BigNumber { value: "53247007608" }
+BigNumber { value: "42871124018" }
+BigNumber { value: "34517153077" }
+BigNumber { value: "27791029333" }
+BigNumber { value: "22375579749" }
+BigNumber { value: "18015402132" }
+BigNumber { value: "14504862785" }
+BigNumber { value: "11678398454" }
+BigNumber { value: "9402708076" }
+BigNumber { value: "7570466062" }
+BigNumber { value: "6095260636" }
+BigNumber { value: "4907518495" }
+BigNumber { value: "3951227569" }
+BigNumber { value: "3181278625" }
+BigNumber { value: "2561364414" }
+BigNumber { value: "2062248686" }
+BigNumber { value: "1660392258" }
+BigNumber { value: "1336842869" }
+BigNumber { value: "1076341357" }
+BigNumber { value: "866602010" }
+BigNumber { value: "697733148" }
+BigNumber { value: "561770617" }
+BigNumber { value: "452302636" }
+BigNumber { value: "364165486" }
+BigNumber { value: "293203025" }
+BigNumber { value: "236068538" }
+BigNumber { value: "190067462" }
+BigNumber { value: "153030304" }
+============
+BigNumber { value: "151670034" }
+BigNumber { value: "150309765" }
+BigNumber { value: "148949495" }
+BigNumber { value: "147589226" }
+BigNumber { value: "146228957" }
+BigNumber { value: "144868687" }
+BigNumber { value: "143508418" }
+BigNumber { value: "142148149" }
+BigNumber { value: "140787879" }
+BigNumber { value: "139427610" }
+BigNumber { value: "138067341" }
+BigNumber { value: "136707071" }
+BigNumber { value: "135346802" }
+BigNumber { value: "133986532" }
+BigNumber { value: "132626263" }
+BigNumber { value: "131265994" }
+BigNumber { value: "129905724" }
+BigNumber { value: "128545455" }
+BigNumber { value: "127185186" }
+BigNumber { value: "125824916" }
+BigNumber { value: "124464647" }
+BigNumber { value: "123104378" }
+BigNumber { value: "121744108" }
+BigNumber { value: "120383839" }
+BigNumber { value: "119023570" }
+BigNumber { value: "117663300" }
+BigNumber { value: "116303031" }
+BigNumber { value: "114942761" }
+BigNumber { value: "113582492" }
+BigNumber { value: "112222223" }
+BigNumber { value: "110861953" }
+BigNumber { value: "109501684" }
+BigNumber { value: "108141415" }
+BigNumber { value: "106781145" }
+BigNumber { value: "105420876" }
+BigNumber { value: "104060607" }
+BigNumber { value: "102700337" }
+============
+BigNumber { value: "101986999" }
+BigNumber { value: "101920591" }
+BigNumber { value: "101854183" }
+BigNumber { value: "101787775" }
+BigNumber { value: "101721367" }
+BigNumber { value: "101654959" }
+BigNumber { value: "101588551" }
+BigNumber { value: "101522143" }
+BigNumber { value: "101455735" }
+BigNumber { value: "101389327" }
+BigNumber { value: "101322919" }
+BigNumber { value: "101256511" }
+BigNumber { value: "101190103" }
+BigNumber { value: "101123695" }
+BigNumber { value: "101057287" }
+BigNumber { value: "100990879" }
+BigNumber { value: "100924471" }
+BigNumber { value: "100858063" }
+BigNumber { value: "100791655" }
+BigNumber { value: "100725247" }
+BigNumber { value: "100658839" }
+BigNumber { value: "100592431" }
+BigNumber { value: "100526023" }
+BigNumber { value: "100459615" }
+BigNumber { value: "100393207" }
+BigNumber { value: "100326799" }
+BigNumber { value: "100260391" }
+BigNumber { value: "100193983" }
+BigNumber { value: "100127575" }
+BigNumber { value: "100061167" }
+BigNumber { value: "99994759" }
+BigNumber { value: "99928351" }
+BigNumber { value: "99861943" }
+BigNumber { value: "99795535" }
+BigNumber { value: "99729127" }
+BigNumber { value: "99662719" }
+BigNumber { value: "99596311" }
+BigNumber { value: "99529903" }
+BigNumber { value: "99463496" }
+BigNumber { value: "99397088" }
+BigNumber { value: "99330680" }
+BigNumber { value: "99264272" }
+BigNumber { value: "99197864" }
+BigNumber { value: "99131456" }
+BigNumber { value: "99065048" }
+BigNumber { value: "98998640" }
+BigNumber { value: "98932232" }
+BigNumber { value: "98865824" }
+BigNumber { value: "98799416" }
+BigNumber { value: "98733008" }
+BigNumber { value: "98666600" }
+BigNumber { value: "98600192" }
+BigNumber { value: "98533784" }
+BigNumber { value: "98467376" }
+BigNumber { value: "98400968" }
+BigNumber { value: "98334560" }
+BigNumber { value: "98268152" }
+BigNumber { value: "98201744" }
+BigNumber { value: "98135336" }
+BigNumber { value: "98068928" }
+BigNumber { value: "98002520" }
+BigNumber { value: "97936112" }
+BigNumber { value: "97869704" }
+BigNumber { value: "97803296" }
+BigNumber { value: "97736888" }
+BigNumber { value: "97670480" }
+BigNumber { value: "97604072" }
+BigNumber { value: "97537664" }
+BigNumber { value: "97471256" }
+BigNumber { value: "97404848" }
+BigNumber { value: "97338440" }
+BigNumber { value: "97272032" }
+BigNumber { value: "97205624" }
+BigNumber { value: "97139216" }
+BigNumber { value: "97072808" }
+============
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+BigNumber { value: "97039604" }
+```

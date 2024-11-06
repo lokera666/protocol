@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
-import "contracts/p1/AssetRegistry.sol";
+import "../../../p1/AssetRegistry.sol";
 
 contract AssetRegistryP1V2 is AssetRegistryP1 {
     uint256 public newValue;
@@ -10,7 +10,7 @@ contract AssetRegistryP1V2 is AssetRegistryP1 {
         newValue = newValue_;
     }
 
-    function version() external pure returns (string memory) {
-        return "V2";
+    function version() public pure override(Versioned, IVersioned) returns (string memory) {
+        return "2.0.0";
     }
 }

@@ -1,30 +1,35 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
+import { anyValue } from '@nomicfoundation/hardhat-chai-matchers/withArgs'
 import { expect } from 'chai'
 import { signERC2612Permit } from 'eth-permit'
-import { BigNumber, Wallet } from 'ethers'
-import hre, { ethers, waffle } from 'hardhat'
+import { BigNumber, ContractFactory } from 'ethers'
+import hre, { ethers, upgrades } from 'hardhat'
 import { getChainId } from '../common/blockchain-utils'
 import { setOraclePrice } from './utils/oracles'
 import { bn, fp, near, shortString } from '../common/numbers'
 import { expectEvents } from '../common/events'
 import {
-  CTokenMock,
   ERC20Mock,
-  Facade,
-  IBasketHandler,
+  ERC1271Mock,
   StRSRP0,
   StRSRP1Votes,
   StaticATokenMock,
+  IAssetRegistry,
   TestIBackingManager,
+  TestIBasketHandler,
+  TestIFacade,
   TestIMain,
   TestIRToken,
   TestIStRSR,
+  CTokenMock,
 } from '../typechain'
-import { IConfig, MAX_PERIOD, MAX_RATIO, MAX_UNSTAKING_DELAY } from '../common/configuration'
-import { CollateralStatus, MAX_UINT256, ZERO_ADDRESS } from '../common/constants'
+import { IConfig, MAX_RATIO, MAX_UNSTAKING_DELAY } from '../common/configuration'
+import { CollateralStatus, MAX_UINT256, ONE_PERIOD, ZERO_ADDRESS } from '../common/constants'
 import {
   advanceBlocks,
   advanceTime,
+  advanceToTimestamp,
   getLatestBlockNumber,
   getLatestBlockTimestamp,
   setNextBlockTimestamp,
@@ -36,18 +41,20 @@ import {
   Implementation,
   IMPLEMENTATION,
   SLOW,
-  ORACLE_TIMEOUT,
+  VERSION,
 } from './fixtures'
 import { makeDecayFn, calcErr } from './utils/rewards'
 import snapshotGasCost from './utils/snapshotGasCost'
 import { cartesianProduct } from './utils/cases'
-
-const createFixtureLoader = waffle.createFixtureLoader
+import { useEnv } from '#/utils/env'
 
 const describeP1 = IMPLEMENTATION == Implementation.P1 ? describe : describe.skip
 
 const describeGas =
-  IMPLEMENTATION == Implementation.P1 && process.env.REPORT_GAS ? describe : describe.skip
+  IMPLEMENTATION == Implementation.P1 && useEnv('REPORT_GAS') ? describe.only : describe.skip
+
+const describeExtreme =
+  IMPLEMENTATION == Implementation.P1 && useEnv('EXTREME') ? describe.only : describe.skip
 
 describe(`StRSRP${IMPLEMENTATION} contract`, () => {
   let owner: SignerWithAddress
@@ -62,9 +69,10 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
   // Main
   let main: TestIMain
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
+  let basketHandler: TestIBasketHandler
   let rToken: TestIRToken
-  let facade: Facade
+  let facade: TestIFacade
+  let assetRegistry: IAssetRegistry
 
   // StRSR
   let stRSR: TestIStRSR
@@ -90,9 +98,6 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
   let initialBal: BigNumber
   let stkWithdrawalDelay: number
 
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
-
   interface IWithdrawal {
     rsrAmount: BigNumber
     availableAt: BigNumber
@@ -117,6 +122,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     } else if (IMPLEMENTATION == Implementation.P1) {
       const stRSRP1 = <StRSRP1Votes>await ethers.getContractAt('StRSRP1Votes', stRSR.address)
       const [draftsCurr, availableAt] = await stRSRP1.draftQueues(1, address, index)
+
       const [draftsPrev] = index == 0 ? [0] : await stRSRP1.draftQueues(1, address, index - 1)
       const drafts = draftsCurr.sub(draftsPrev)
 
@@ -133,10 +139,13 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     }
   }
 
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
+  // Only used for P1, checks the length of the draft queue
+  const expectDraftQueue = async (era: number, account: string, expectedValue: number) => {
+    if (IMPLEMENTATION == Implementation.P1) {
+      const stRSRP1 = <StRSRP1Votes>await ethers.getContractAt('StRSRP1Votes', stRSR.address)
+      expect(await stRSRP1.draftQueueLen(era, account)).to.equal(expectedValue)
+    } else return
+  }
 
   beforeEach(async () => {
     ;[owner, addr1, addr2, addr3, other] = await ethers.getSigners()
@@ -153,6 +162,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       basketHandler,
       rToken,
       facade,
+      assetRegistry,
     } = await loadFixture(defaultFixture))
 
     // Mint initial amounts of RSR
@@ -188,30 +198,63 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       expect(await stRSR.exchangeRate()).to.equal(fp('1'))
       expect(await stRSR.unstakingDelay()).to.equal(config.unstakingDelay)
-      expect(await stRSR.rewardPeriod()).to.equal(config.rewardPeriod)
       expect(await stRSR.rewardRatio()).to.equal(config.rewardRatio)
     })
 
     it('Should setup the DomainSeparator for Permit correctly', async () => {
       const chainId = await getChainId(hre)
       const _name = await stRSR.name()
-      const version = '1'
       const verifyingContract = stRSR.address
       expect(await stRSR.DOMAIN_SEPARATOR()).to.equal(
         await ethers.utils._TypedDataEncoder.hashDomain({
           name: _name,
-          version,
+          version: VERSION,
           chainId,
           verifyingContract,
         })
       )
+    })
+
+    it('Should perform validations on init', async () => {
+      let StRSRFactory: ContractFactory = await ethers.getContractFactory('StRSRP0')
+      let newStRSR: TestIStRSR = <TestIStRSR>await StRSRFactory.deploy()
+
+      if (IMPLEMENTATION == Implementation.P1) {
+        // Create a new StRSR
+        StRSRFactory = await ethers.getContractFactory('StRSRP1Votes')
+        newStRSR = <TestIStRSR>await StRSRFactory.deploy()
+        newStRSR = <TestIStRSR>await upgrades.deployProxy(StRSRFactory, [], {
+          kind: 'uups',
+        })
+      }
+
+      await expect(
+        newStRSR.init(
+          main.address,
+          '',
+          'rtknRSR',
+          config.unstakingDelay,
+          config.rewardRatio,
+          config.withdrawalLeak
+        )
+      ).to.be.reverted
+      await expect(
+        newStRSR.init(
+          main.address,
+          'rtknRSR Token',
+          '',
+          config.unstakingDelay,
+          config.rewardRatio,
+          config.withdrawalLeak
+        )
+      ).to.be.reverted
     })
   })
 
   describe('Configuration / State #fast', () => {
     it('Should allow to update unstakingDelay if Owner and perform validations', async () => {
       // Setup a new value
-      const newUnstakingDelay: BigNumber = config.rewardPeriod.mul(2).add(1000)
+      const newUnstakingDelay: BigNumber = ONE_PERIOD.mul(2).add(1000)
 
       await expect(stRSR.connect(owner).setUnstakingDelay(newUnstakingDelay))
         .to.emit(stRSR, 'UnstakingDelaySet')
@@ -225,9 +268,9 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       )
 
       // Cannot update with invalid unstaking delay
-      await expect(stRSR.connect(owner).setUnstakingDelay(config.rewardPeriod)).to.be.revertedWith(
-        'unstakingDelay/rewardPeriod incompatible'
-      )
+      await expect(
+        stRSR.connect(owner).setUnstakingDelay(ONE_PERIOD.mul(2).sub(1))
+      ).to.be.revertedWith('invalid unstakingDelay')
 
       // Cannot update with zero unstaking delay
       await expect(stRSR.connect(owner).setUnstakingDelay(bn(0))).to.be.revertedWith(
@@ -240,44 +283,13 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       ).to.be.revertedWith('invalid unstakingDelay')
     })
 
-    it('Should allow to update rewardPeriod if Owner and perform validations', async () => {
-      // Setup a new value
-      const newRewardPeriod: BigNumber = bn('100000')
-
-      await expect(stRSR.connect(owner).setRewardPeriod(newRewardPeriod))
-        .to.emit(stRSR, 'RewardPeriodSet')
-        .withArgs(config.rewardPeriod, newRewardPeriod)
-
-      expect(await stRSR.rewardPeriod()).to.equal(newRewardPeriod)
-
-      // Try to update again if not owner
-      await expect(stRSR.connect(addr1).setRewardPeriod(bn('500'))).to.be.revertedWith(
-        'governance only'
-      )
-
-      // Cannot update with invalid reward period
-      await expect(stRSR.connect(owner).setRewardPeriod(config.unstakingDelay)).to.be.revertedWith(
-        'unstakingDelay/rewardPeriod incompatible'
-      )
-
-      // Cannot update with period = 0
-      await expect(stRSR.connect(owner).setRewardPeriod(bn(0))).to.be.revertedWith(
-        'invalid rewardPeriod'
-      )
-
-      // Cannot update with period > max
-      await expect(stRSR.connect(owner).setRewardPeriod(MAX_PERIOD + 1)).to.be.revertedWith(
-        'invalid rewardPeriod'
-      )
-    })
-
     it('Should allow to update rewardRatio if Owner and perform validations', async () => {
       // Setup a new value
       const newRatio: BigNumber = bn('100000')
 
       await expect(stRSR.connect(owner).setRewardRatio(newRatio))
         .to.emit(stRSR, 'RewardRatioSet')
-        .withArgs(stRSR.rewardRatio, newRatio)
+        .withArgs(config.rewardRatio, newRatio)
 
       expect(await stRSR.rewardRatio()).to.equal(newRatio)
 
@@ -291,6 +303,88 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         'invalid rewardRatio'
       )
     })
+
+    it('Should allow to update withdrawalLeak if Owner and perform validations', async () => {
+      // Setup a new value
+      const newLeak: BigNumber = fp('0.1') // 10%
+
+      await expect(stRSR.connect(owner).setWithdrawalLeak(newLeak))
+        .to.emit(stRSR, 'WithdrawalLeakSet')
+        .withArgs(config.withdrawalLeak, newLeak)
+
+      expect(await stRSR.withdrawalLeak()).to.equal(newLeak)
+
+      // Try to update again if not owner
+      await expect(stRSR.connect(addr1).setWithdrawalLeak(bn('0'))).to.be.revertedWith(
+        'governance only'
+      )
+
+      // Cannot update with withdrawalLeak > max
+      await expect(stRSR.connect(owner).setWithdrawalLeak(fp('0.3').add(1))).to.be.revertedWith(
+        'invalid withdrawalLeak'
+      )
+    })
+
+    it('Should payout rewards before updating the reward ratio', async () => {
+      const startBal = await rsr.balanceOf(addr1.address)
+      const stakeAmt = bn('100e18')
+      await rsr.connect(addr1).approve(stRSR.address, stakeAmt)
+      await stRSR.connect(addr1).stake(stakeAmt)
+
+      // send some rewards
+      await rsr.connect(addr2).transfer(stRSR.address, bn('10e18'))
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1200)
+
+      await stRSR.setRewardRatio(bn('1e13'))
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1200)
+
+      await stRSR.connect(addr1).unstake(stakeAmt)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1209600)
+      await stRSR.connect(addr1).withdraw(addr1.address, 1)
+
+      const endingBal = await rsr.balanceOf(addr1.address)
+      expect(endingBal.sub(startBal)).gt(0)
+    })
+
+    it('Should payout rewards when updating the reward ratio, even if frozen', async () => {
+      const startBal = await rsr.balanceOf(addr1.address)
+      const stakeAmt = bn('100e18')
+      await rsr.connect(addr1).approve(stRSR.address, stakeAmt)
+      await stRSR.connect(addr1).stake(stakeAmt)
+
+      // send some rewards
+      await rsr.connect(addr2).transfer(stRSR.address, bn('10e18'))
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1200)
+
+      // Freeze Main
+      await main.connect(owner).freezeShort()
+
+      // Set reward ratio - rewards payout
+      await expectEvents(stRSR.setRewardRatio(bn('1e13')), [
+        {
+          contract: stRSR,
+          name: 'ExchangeRateSet',
+          emitted: true,
+        },
+        {
+          contract: stRSR,
+          name: 'RewardsPaid',
+          emitted: true,
+        },
+      ])
+
+      // Unfreeze Main
+      await main.connect(owner).unfreeze()
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1200)
+
+      await stRSR.connect(addr1).unstake(stakeAmt)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1209600)
+      await stRSR.connect(addr1).withdraw(addr1.address, 1)
+
+      // Rewards paid
+      const endingBal = await rsr.balanceOf(addr1.address)
+      expect(endingBal.sub(startBal)).gt(0)
+    })
   })
 
   describe('Deposits/Staking', () => {
@@ -301,7 +395,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       // Approve transfer and stake
       await rsr.connect(addr1).approve(stRSR.address, amount)
-      await expect(stRSR.connect(addr1).stake(zero)).to.be.revertedWith('Cannot stake zero')
+      await expect(stRSR.connect(addr1).stake(zero)).to.be.revertedWith('zero amount')
 
       // Check deposit not registered
       expect(await rsr.balanceOf(stRSR.address)).to.equal(0)
@@ -310,12 +404,30 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
     })
 
+    it('Should not allow to stake from the zero address', async () => {
+      // Perform stake
+      const amount: BigNumber = bn('1000e18')
+
+      if (IMPLEMENTATION == Implementation.P0) {
+        await whileImpersonating(ZERO_ADDRESS, async (signer) => {
+          await expect(stRSR.connect(signer).stake(amount)).to.be.revertedWith(
+            'ERC20: insufficient allowance'
+          )
+        })
+      } else if (IMPLEMENTATION == Implementation.P1) {
+        await whileImpersonating(ZERO_ADDRESS, async (signer) => {
+          await expect(stRSR.connect(signer).stake(amount)).to.be.revertedWith('zero address')
+        })
+      }
+    })
+
     it('Should allow to stake if Main is Paused', async () => {
       // Perform stake
       const amount: BigNumber = bn('1000e18')
 
       // Pause Main
-      await main.connect(owner).pause()
+      await main.connect(owner).pauseTrading()
+      await main.connect(owner).pauseIssuance()
 
       // Approve transfer and stake
       await rsr.connect(addr1).approve(stRSR.address, amount)
@@ -328,7 +440,9 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
     })
 
-    it('Should allow to stake if Main is Frozen', async () => {
+    it('Should still allow to stake if frozen', async () => {
+      // This is crucial for governace to function
+
       // Perform stake
       const amount: BigNumber = bn('1000e18')
 
@@ -338,11 +452,6 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Approve transfer and stake
       await rsr.connect(addr1).approve(stRSR.address, amount)
       await stRSR.connect(addr1).stake(amount)
-
-      // Check deposit registered
-      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount)
-      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount)
-      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
     })
 
@@ -405,24 +514,42 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       const zero: BigNumber = bn(0)
 
       // Unstake
-      await expect(stRSR.connect(addr1).unstake(zero)).to.be.revertedWith('Cannot withdraw zero')
+      await expect(stRSR.connect(addr1).unstake(zero)).to.be.revertedWith('zero amount')
     })
 
     it('Should not allow to unstake if not enough balance', async () => {
       const amount: BigNumber = bn('1000e18')
 
       // Unstake with no stakes/balance
-      await expect(stRSR.connect(addr1).unstake(amount)).to.be.revertedWith('Not enough balance')
+      await expect(stRSR.connect(addr1).unstake(amount)).to.be.revertedWith('insufficient balance')
     })
 
     it('Should not unstake if paused', async () => {
-      await main.connect(owner).pause()
-      await expect(stRSR.connect(addr1).unstake(0)).to.be.revertedWith('paused or frozen')
+      await main.connect(owner).pauseTrading()
+      await expect(stRSR.connect(addr1).unstake(0)).to.be.revertedWith('frozen or trading paused')
     })
 
     it('Should not unstake if frozen', async () => {
       await main.connect(owner).freezeShort()
-      await expect(stRSR.connect(addr1).unstake(0)).to.be.revertedWith('paused or frozen')
+      await expect(stRSR.connect(addr1).unstake(0)).to.be.revertedWith('frozen or trading paused')
+    })
+
+    it('Should emit UnstakingStarted event with draftEra -- regression test 01/18/2024', async () => {
+      const amount: BigNumber = bn('1000e18')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, amount)
+      await stRSR.connect(addr1).stake(amount)
+
+      // Seize half the RSR, bumping the draftEra because the withdrawal queue is empty
+      await whileImpersonating(backingManager.address, async (signer) => {
+        await stRSR.connect(signer).seizeRSR(amount.div(2))
+      })
+
+      // Unstake
+      await expect(stRSR.connect(addr1).unstake(amount))
+        .emit(stRSR, 'UnstakingStarted')
+        .withArgs(0, 2, addr1.address, amount.div(2), amount, anyValue)
     })
 
     it('Should create Pending withdrawal when unstaking', async () => {
@@ -483,6 +610,9 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       await expectWithdrawal(addr1.address, 0, { rsrAmount: amount1 })
 
+      // Check draftQueueLen
+      await expectDraftQueue(1, addr1.address, 1)
+
       // All staked funds withdrawn upfront
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount2)
 
@@ -497,6 +627,8 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         .withArgs(1, 1, addr1.address, amount2, amount2, availableAt)
 
       await expectWithdrawal(addr1.address, 1, { rsrAmount: amount2 })
+
+      await expectDraftQueue(1, addr1.address, 2)
 
       // All staked funds withdrawn upfront
       expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
@@ -513,11 +645,132 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       await expectWithdrawal(addr2.address, 0, { rsrAmount: amount3 })
 
+      await expectDraftQueue(1, addr1.address, 2)
+      await expectDraftQueue(1, addr2.address, 1)
+
       // All staked funds withdrawn upfront
       expect(await stRSR.balanceOf(addr2.address)).to.equal(0)
 
       // Exchange rate remains steady
       expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+    })
+
+    it('Should allow cancelling unstaking', async () => {
+      const amount: BigNumber = bn('1000e18')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, amount)
+      await stRSR.connect(addr1).stake(amount)
+      const availableAt = (await getLatestBlockTimestamp()) + config.unstakingDelay.toNumber() + 1
+
+      // Set next block timestamp - for deterministic result
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+
+      // Unstake
+      await expect(stRSR.connect(addr1).unstake(amount))
+        .emit(stRSR, 'UnstakingStarted')
+        .withArgs(0, 1, addr1.address, amount, amount, availableAt)
+
+      // Check withdrawal properly registered
+      await expectWithdrawal(addr1.address, 0, { rsrAmount: amount })
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount)
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
+
+      // All staked funds withdrawn upfront
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
+      expect(await stRSR.totalSupply()).to.equal(0)
+
+      // Exchange rate remains steady
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+
+      // Cancelling the unstake with invalid index does nothing
+      await expect(stRSR.connect(addr1).cancelUnstake(0)).to.not.emit(stRSR, 'UnstakingCancelled')
+      await expect(stRSR.connect(addr1).cancelUnstake(2)).to.be.revertedWith('index out-of-bounds')
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
+      expect(await stRSR.totalSupply()).to.equal(0)
+
+      // Let's cancel the unstake
+      await expect(stRSR.connect(addr1).cancelUnstake(1)).to.emit(stRSR, 'UnstakingCancelled')
+
+      // Check balances and stakes
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
+      expect(await stRSR.totalSupply()).to.equal(amount)
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount) // RSR is still in the contract
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount)) // RSR wasn't returned
+    })
+
+    it('Should not allow to cancel unstake if frozen', async () => {
+      const amount: BigNumber = bn('1000e18')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, amount)
+      await stRSR.connect(addr1).stake(amount)
+
+      // Unstake
+      await stRSR.connect(addr1).unstake(amount)
+
+      // Freeze Main
+      await main.connect(owner).freezeShort()
+
+      // Attempt to cancel unstake
+      await expect(stRSR.connect(addr1).cancelUnstake(1)).to.be.revertedWith('frozen')
+    })
+
+    describe('Withdrawal Leak', () => {
+      const withdrawalLeak = fp('0.1') // 10%
+      const stake = bn('1000e18')
+
+      beforeEach(async () => {
+        stkWithdrawalDelay = bn(await stRSR.unstakingDelay()).toNumber()
+
+        // Stake
+        await rsr.connect(addr1).approve(stRSR.address, stake)
+        await stRSR.connect(addr1).stake(stake)
+
+        // Set Withdrawal Leak
+        await expect(stRSR.connect(owner).setWithdrawalLeak(withdrawalLeak))
+          .to.emit(stRSR, 'WithdrawalLeakSet')
+          .withArgs(config.withdrawalLeak, withdrawalLeak)
+      })
+
+      it('Should refresh above withdrawal leak only', async () => {
+        const withdrawal = stake.mul(withdrawalLeak).div(fp('1'))
+        await stRSR.connect(addr1).unstake(withdrawal)
+        await stRSR.connect(addr1).unstake(1)
+        await stRSR.connect(addr1).unstake(1)
+
+        // Move forward past stakingWithdrawalDelaylay
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+        let lastRefresh = await assetRegistry.lastRefresh()
+
+        // Should not refresh
+        await stRSR.withdraw(addr1.address, 1)
+        expect(await assetRegistry.lastRefresh()).to.eq(lastRefresh)
+
+        // Should refresh
+        await stRSR.withdraw(addr1.address, 2)
+        expect(await assetRegistry.lastRefresh()).to.be.gt(lastRefresh)
+        lastRefresh = await assetRegistry.lastRefresh()
+
+        // Should not refresh
+        await stRSR.withdraw(addr1.address, 3)
+        expect(await assetRegistry.lastRefresh()).to.eq(lastRefresh)
+      })
+
+      it('Should prevent unstaking', async () => {
+        const withdrawal = stake.mul(withdrawalLeak).div(fp('1')).add(1)
+        await stRSR.connect(addr1).unstake(withdrawal)
+
+        // Move forward past stakingWithdrawalDelaylay
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+        // Depeg collateral
+        await setOraclePrice(collateral1.address, bn('0.5e8'))
+        await expect(stRSR.withdraw(addr1.address, 1)).to.be.revertedWith('RToken readying')
+      })
     })
 
     context('With deposits and withdrawals', () => {
@@ -551,18 +804,18 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         const prevAddr1Balance = await rsr.balanceOf(addr1.address)
 
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         // Pause Main
-        await main.connect(owner).pause()
+        await main.connect(owner).pauseTrading()
 
         // Withdraw
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
-          'paused or frozen'
+          'frozen or trading paused'
         )
 
         // If unpaused should withdraw OK
-        await main.connect(owner).unpause()
+        await main.connect(owner).unpauseTrading()
 
         // Withdraw
         await stRSR.connect(addr1).withdraw(addr1.address, 1)
@@ -579,14 +832,14 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         const prevAddr1Balance = await rsr.balanceOf(addr1.address)
 
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         // Freeze Main
         await main.connect(owner).freezeShort()
 
         // Withdraw
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
-          'paused or frozen'
+          'frozen or trading paused'
         )
 
         // If unpaused should withdraw OK
@@ -602,8 +855,8 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
       })
 
-      it('Should not complete withdrawal if not fully capitalized', async () => {
-        // Need to issue some RTokens to handle fully/not fully capitalized
+      it('Should not complete withdrawal if not fully collateralized', async () => {
+        // Need to issue some RTokens to handle fully/not fully collateralized
         await token0.connect(owner).mint(addr1.address, initialBal)
         await token1.connect(owner).mint(addr1.address, initialBal)
         await token2.connect(owner).mint(addr1.address, initialBal)
@@ -623,21 +876,21 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         const prevAddr1Balance = await rsr.balanceOf(addr1.address)
 
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         const erc20s = await facade.basketTokens(rToken.address)
 
-        // Set not fully capitalized by changing basket
+        // Set not fully collateralized by changing basket
         await basketHandler.connect(owner).setPrimeBasket([token0.address], [fp('1')])
         await basketHandler.connect(owner).refreshBasket()
         expect(await basketHandler.fullyCollateralized()).to.equal(false)
 
         // Withdraw
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
-          'RToken uncapitalized'
+          'RToken readying'
         )
 
-        // If fully capitalized should withdraw OK  - Set back original basket
+        // If fully collateralized should withdraw OK  - Set back original basket
         await basketHandler.connect(owner).setPrimeBasket(erc20s, basketsNeededAmts)
         await basketHandler.connect(owner).refreshBasket()
 
@@ -654,9 +907,9 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
       })
 
-      it('Should not complete withdrawal if basket defaulted', async () => {
+      it('Should not complete withdrawal if IFFY or DISABLED', async () => {
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         // Set Token1 to default - 50% price reduction and mark default as probable
         await setOraclePrice(collateral1.address, bn('0.5e8'))
@@ -666,29 +919,28 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
         // Attempt to Withdraw
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
-          'basket defaulted'
+          'RToken readying'
         )
 
         // Nothing completed
         expect(await stRSR.totalSupply()).to.equal(amount2.add(amount3))
         expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount1))
         expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
-      })
 
-      it('Should not complete withdrawal if UNPRICED collateral', async () => {
-        await advanceTime(ORACLE_TIMEOUT.toString())
+        // Move past DELAY_UNTIL_DEFAULT
+        await setNextBlockTimestamp(
+          (await collateral1.delayUntilDefault()) + (await getLatestBlockTimestamp())
+        )
+
+        // Still can't withdraw
         await collateral1.refresh()
-        expect(await basketHandler.status()).to.equal(CollateralStatus.UNPRICED)
+        expect(await basketHandler.status()).to.equal(CollateralStatus.DISABLED)
+        expect(await basketHandler.fullyCollateralized()).to.equal(true)
 
         // Attempt to Withdraw
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
-          'basket defaulted'
+          'RToken readying'
         )
-
-        // Nothing completed
-        expect(await stRSR.totalSupply()).to.equal(amount2.add(amount3))
-        expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount1))
-        expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
       })
 
       it('Should not withdraw before stakingWithdrawalDelay', async () => {
@@ -703,7 +955,9 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
 
         // Withdraw after certain time (still before stakingWithdrawalDelay)
-        await advanceTime(stkWithdrawalDelay / 2)
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2
+        )
 
         await expect(stRSR.connect(addr1).withdraw(addr1.address, 1)).to.be.revertedWith(
           'withdrawal unavailable'
@@ -715,12 +969,34 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
       })
 
+      it('Should not withdraw if firstId >= endId', async () => {
+        const prevAddr1Balance = await rsr.balanceOf(addr1.address)
+
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+        // Withdraw
+        await stRSR.connect(addr1).withdraw(addr1.address, 1)
+
+        // Withdrawal was completed
+        expect(await stRSR.totalSupply()).to.equal(amount2.add(amount3))
+        expect(await rsr.balanceOf(stRSR.address)).to.equal(await stRSR.totalSupply())
+        expect(await rsr.balanceOf(addr1.address)).to.equal(prevAddr1Balance.add(amount1))
+
+        // withdraw with same ID, nothing happens
+        await stRSR.connect(addr1).withdraw(addr1.address, 1)
+
+        // Nothing changed since second withdrawal
+        expect(await stRSR.totalSupply()).to.equal(amount2.add(amount3))
+        expect(await rsr.balanceOf(stRSR.address)).to.equal(await stRSR.totalSupply())
+        expect(await rsr.balanceOf(addr1.address)).to.equal(prevAddr1Balance.add(amount1))
+      })
+
       it('Should withdraw after stakingWithdrawalDelay', async () => {
         // Get current balance for user
         const prevAddr1Balance = await rsr.balanceOf(addr1.address)
 
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         // Attempt to withdraw with zero index, nothing happens
         await stRSR.connect(addr1).withdraw(addr1.address, 0)
@@ -755,11 +1031,17 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         const prevAddr1Balance = await rsr.balanceOf(addr1.address)
         const prevAddr2Balance = await rsr.balanceOf(addr2.address)
 
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(0)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(0)
+
         // Create additional withdrawal
         await stRSR.connect(addr2).unstake(amount2)
 
         // Move forward past stakingWithdrawalDelaylay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(1)
 
         // Withdraw
         await stRSR
@@ -781,7 +1063,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSR.connect(addr2).unstake(amount3)
 
         // Move forward past stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
         // Withdraw
         await stRSR
@@ -802,7 +1084,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.exchangeRate()).to.equal(fp('1'))
       })
 
-      it('Should calculate available withrawals correctly', async function () {
+      it('Should calculate available withdrawals correctly', async function () {
         // Create an additional third stake for user 2
         await rsr.connect(addr2).approve(stRSR.address, amount3)
         await stRSR.connect(addr2).stake(amount3)
@@ -815,36 +1097,38 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSR.connect(addr2).unstake(amount2)
 
         // Move time forward to half of first period
-        await advanceTime(stkWithdrawalDelay / 2)
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2
+        )
 
-        // Create additional withrawal for user 2
+        // Create additional withdrawal for user 2
         await stRSR.connect(addr2).unstake(amount3)
 
-        // Check withrawals - Nothing available yet
+        // Check withdrawals - Nothing available yet
         expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(0)
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(0)
 
         // Move time forward to first period complete
-        await advanceTime(stkWithdrawalDelay / 2 + 1)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2)
 
-        // Check withrawals - We can withdraw the first stakes for each
+        // Check withdrawals - We can withdraw the first stakes for each
         expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(1)
 
-        // Create additional withrawal for user 2
+        // Create additional withdrawal for user 2
         await stRSR.connect(addr2).unstake(amount3)
 
         // Move time forward to end of second period
-        await advanceTime(stkWithdrawalDelay / 2 + 1)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2)
 
-        // Check withrawals - We can withdraw the second stake for user 2
+        // Check withdrawals - We can withdraw the second stake for user 2
         expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(2)
 
         // Move time forward to end of all periods
-        await advanceTime(stkWithdrawalDelay * 2)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay * 2)
 
-        // Check withrawals - We can withdraw the third stake for user 2
+        // Check withdrawals - We can withdraw the third stake for user 2
         expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(3)
 
@@ -870,6 +1154,96 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSR.exchangeRate()).to.equal(fp('1'))
       })
 
+      it('Allow cancelling unstake with multiple withdraws', async function () {
+        // Create an additional third stake for user 2
+        await rsr.connect(addr2).approve(stRSR.address, amount3)
+        await stRSR.connect(addr2).stake(amount3)
+
+        // Create 1st withdrawal for user 2
+        await stRSR.connect(addr2).unstake(amount2)
+
+        // Move time forward to half of first period
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2
+        )
+
+        await hre.network.provider.send('evm_setAutomine', [false])
+
+        // Send reward RSR -- bn('3e18')
+        await rsr.connect(addr1).transfer(stRSR.address, amount3)
+        await stRSR.connect(owner).setRewardRatio(bn('1e14')) // handout max ratio
+
+        // Create 2nd withdrawal for user 2 -- should unstake at 1:1 rate
+        expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+        await stRSR.connect(addr2).unstake(amount3)
+
+        await hre.network.provider.send('evm_setAutomine', [true])
+
+        // Mine block
+        await advanceTime(1)
+
+        expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+
+        // Check withdrawals - Nothing available yet
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(0)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(0)
+
+        // Move time forward 3/4 of way to first period complete
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 4
+        )
+
+        // Cancel 1st withdrawal
+        await stRSR.connect(addr2).cancelUnstake(1)
+
+        // Calculate new exchange rate ~1.91 -- regression test
+        const decayFn = makeDecayFn(await stRSR.rewardRatio())
+        const numRounds = stkWithdrawalDelay / 4
+        const rewardHandout = amount3.sub(decayFn(amount3, numRounds))
+        const newExchangeRate = amount3.add(rewardHandout).mul(fp('1')).div(amount3).add(1)
+        expect(await stRSR.exchangeRate()).to.be.closeTo(newExchangeRate, bn(200))
+
+        // Move time forward to first period complete
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 4)
+
+        // Check withdrawals - We can withdraw the first stakes for each
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(1)
+
+        // Create 3rd withdrawal for user 2
+        await stRSR.connect(addr2).unstake(amount3)
+
+        // Move time forward to end of second period
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay / 2)
+
+        // Check withdrawals - We can withdraw the second stake for user 2
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(2)
+
+        // Move time forward to end of all periods
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay * 2)
+
+        // Check withdrawals - We can withdraw the third stake for user 2
+        expect(await stRSR.endIdForWithdraw(addr1.address)).to.equal(1)
+        expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(3)
+
+        // Cancelling the unstake with invalid index does nothing
+        await expect(stRSR.connect(addr2).cancelUnstake(1)).to.not.emit(stRSR, 'UnstakingCancelled')
+        await expect(stRSR.connect(addr2).cancelUnstake(4)).to.be.revertedWith(
+          'index out-of-bounds'
+        )
+
+        // Withdraw everything
+        await stRSR.connect(addr1).withdraw(addr1.address, 1)
+        await stRSR.connect(addr2).withdraw(addr2.address, 3)
+        expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
+        expect(await stRSR.totalSupply()).to.be.gt(amount1)
+        expect(await stRSR.totalSupply()).to.be.lt(amount1.add(amount1.div(20))) // 5%
+
+        /// Exchange rate should increase
+        expect(await stRSR.exchangeRate()).to.be.gt(newExchangeRate)
+      })
+
       it('Should handle changes in stakingWithdrawalDelay correctly', async function () {
         // Get current balance for user 2
         const prevAddr2Balance = await rsr.balanceOf(addr2.address)
@@ -878,12 +1252,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSR.connect(addr2).unstake(amount2)
 
         // Reduce staking withdrawal delay significantly - Also need to update rewardPeriod
-        const newRewardPeriod: BigNumber = bn('86400') // 1 day
-        const newUnstakingDelay: BigNumber = newRewardPeriod.mul(2) // 2 days
-
-        await expect(stRSR.connect(owner).setRewardPeriod(newRewardPeriod))
-          .to.emit(stRSR, 'RewardPeriodSet')
-          .withArgs(config.rewardPeriod, newRewardPeriod)
+        const newUnstakingDelay: BigNumber = bn(172800) // 2 days
 
         await expect(stRSR.connect(owner).setUnstakingDelay(newUnstakingDelay))
           .to.emit(stRSR, 'UnstakingDelaySet')
@@ -894,21 +1263,21 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
         // Move forward time past this second stake
         // Should not be processed, only after the first pending stake is done
-        await advanceTime(Number(newUnstakingDelay) + 1)
+        await advanceToTimestamp(Number(newUnstakingDelay.add(await getLatestBlockTimestamp())))
 
-        // Check withrawals - Nothing available yet
+        // Check withdrawals - Nothing available yet
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(0)
 
-        // Nothing compeleted still
+        // Nothing completed still
         expect(await stRSR.totalSupply()).to.equal(0)
         expect(await rsr.balanceOf(addr2.address)).to.equal(prevAddr2Balance)
         // All staked funds withdrawn upfront
         expect(await stRSR.balanceOf(addr2.address)).to.equal(0)
 
         // Move forward past first stakingWithdrawalDelay
-        await advanceTime(stkWithdrawalDelay + 1)
+        await advanceToTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
 
-        //  Check withrawals - We can withdraw both stakes
+        //  Check withdrawals - We can withdraw both stakes
         expect(await stRSR.endIdForWithdraw(addr2.address)).to.equal(2)
 
         // Withdraw with correct index
@@ -925,6 +1294,26 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
         // Exchange rate remains steady
         expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+      })
+
+      describeP1('Should be able to view staking/withdrawal quantities', () => {
+        let stRSRP1: StRSRP1Votes
+
+        beforeEach(async () => {
+          stRSRP1 = await ethers.getContractAt('StRSRP1Votes', stRSR.address)
+        })
+
+        it('Should read draftRSR', async () => {
+          expect(await stRSRP1.getDraftRSR()).to.equal(amount1)
+        })
+
+        it('Should read stakeRSR', async () => {
+          expect(await stRSRP1.getStakeRSR()).to.equal(amount2.add(amount3))
+        })
+
+        it('Should read totalDrafts', async () => {
+          expect(await stRSRP1.getTotalDrafts()).to.equal(amount1)
+        })
       })
     })
   })
@@ -949,7 +1338,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.exchangeRate()).to.equal(initialRate)
 
       // Advance to the end of noop period
-      await advanceTime(Number(config.rewardPeriod) + 1)
+      await setNextBlockTimestamp(Number(ONE_PERIOD.add(await getLatestBlockTimestamp())))
 
       await expectEvents(stRSR.payoutRewards(), [
         {
@@ -987,7 +1376,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await rsr.connect(addr1).approve(stRSR.address, stake)
       await stRSR.connect(addr1).stake(stake)
 
-      await advanceTime(Number(config.rewardPeriod) + 1)
+      await setNextBlockTimestamp(Number(ONE_PERIOD.add(await getLatestBlockTimestamp())))
       expect(await stRSR.exchangeRate()).to.equal(initialRate)
 
       // Stake 2
@@ -998,25 +1387,33 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(stake)
       expect(await stRSR.balanceOf(addr2.address)).to.be.lt(stake)
       expect(await rsr.balanceOf(stRSR.address)).to.equal(stake.mul(2).add(amountAdded))
-      expect(await stRSR.exchangeRate()).to.be.lt(initialRate)
+      expect(await stRSR.exchangeRate()).to.be.gt(initialRate)
     })
 
-    it('Rewards should not be handed out when paused but staking should still work', async () => {
-      await main.connect(owner).pause()
-      await advanceTime(Number(config.rewardPeriod) + 1)
-
+    it('Rewards should be handed, even if frozen', async () => {
       // Stake
       await rsr.connect(addr1).approve(stRSR.address, stake)
       await stRSR.connect(addr1).stake(stake)
 
-      expect(await stRSR.balanceOf(addr1.address)).to.equal(stake)
-      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(stake))
+      await setNextBlockTimestamp(Number(ONE_PERIOD.add(await getLatestBlockTimestamp())))
       expect(await stRSR.exchangeRate()).to.equal(initialRate)
+
+      // Freeze main
+      await main.connect(owner).freezeShort()
+
+      // Payout rewards
+      await stRSR.payoutRewards()
+
+      // Should get new exchange rate
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stake)
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(stake.add(amountAdded))
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(stake))
+      expect(await stRSR.exchangeRate()).to.be.gt(initialRate)
     })
 
-    it('Rewards should not be handed out when frozen but staking should still work', async () => {
-      await main.connect(owner).freezeLong()
-      await advanceTime(Number(config.rewardPeriod) + 1)
+    it('Rewards should not be handed out when paused but staking should still work', async () => {
+      await main.connect(owner).pauseTrading()
+      await setNextBlockTimestamp(Number(ONE_PERIOD.add(await getLatestBlockTimestamp())))
 
       // Stake
       await rsr.connect(addr1).approve(stRSR.address, stake)
@@ -1033,18 +1430,17 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await stRSR.connect(addr1).stake(stake)
 
       // Advance to get 1 round of rewards
-      await advanceTime(Number(config.rewardPeriod) + 1)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
 
       // Calculate payout amount
       const addedRSRStake = amountAdded.sub(decayFn(amountAdded, 1)) // 1 round
-      const newRate: BigNumber = fp(stake).div(stake.add(addedRSRStake))
+      const newRate: BigNumber = fp(stake.add(addedRSRStake)).div(stake)
 
       // Payout rewards
       await expectEvents(stRSR.payoutRewards(), [
         {
           contract: stRSR,
           name: 'ExchangeRateSet',
-          args: [initialRate, newRate],
           emitted: true,
         },
         {
@@ -1054,9 +1450,8 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
           emitted: true,
         },
       ])
-
-      // Check exchange rate
-      expect(await stRSR.exchangeRate()).to.equal(newRate)
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newRate)
 
       // Check new balances and stakes
       expect(await rsr.balanceOf(stRSR.address)).to.equal(stake.add(amountAdded))
@@ -1084,19 +1479,16 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr2.address)).to.equal(stake.div(2))
 
       // Advance to get 1 round of rewards
-      await advanceTime(Number(config.rewardPeriod) + 1)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
 
       // Calculate payout amount
       const addedRSRStake = amountAdded.sub(decayFn(amountAdded, 1)) // 1 round
-      const newRate: BigNumber = fp(stake).div(stake.add(addedRSRStake))
+      const newRate: BigNumber = fp(stake.add(addedRSRStake)).div(stake)
 
       // Payout rewards
-      await expect(stRSR.payoutRewards())
-        .to.emit(stRSR, 'ExchangeRateSet')
-        .withArgs(initialRate, newRate)
-
-      // Check exchange rate
-      expect(await stRSR.exchangeRate()).to.equal(newRate)
+      await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newRate)
 
       // Check new balances and stakes
       expect(await rsr.balanceOf(stRSR.address)).to.equal(stake.add(amountAdded))
@@ -1114,21 +1506,22 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await stRSR.connect(addr1).stake(stake)
 
       const decayFn = makeDecayFn(await stRSR.rewardRatio())
-      let error = bn('0')
+      let error = bn('2')
       for (let i = 0; i < 100; i++) {
         // Advance to get 1 round of rewards
-        await advanceTime(Number(config.rewardPeriod) + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
 
         // Calculate payout amount, as if closed-form from the beginning
         const addedRSRStake = amountAdded.sub(decayFn(amountAdded, 1 + i)) // 1+i rounds
-        const newRate: BigNumber = fp(stake).div(stake.add(addedRSRStake))
+        const newRate: BigNumber = fp(stake.add(addedRSRStake)).add(stake.div(2)).div(stake)
 
         // Payout rewards
         await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
 
-        error = error.add(calcErr(1)) // this is just adding 1 each time
+        // error = error.add(calcErr(1)) // this is just adding 1 each time
+        error = error.add(calcErr(2))
 
-        // Check exchange rate does not exceed max possible cumulative error
+        // Check exchange rate does not exceed more than the acceptable amount per round
         expect(near(await stRSR.exchangeRate(), newRate, error)).to.equal(true)
 
         // Check new balances and stakes
@@ -1146,17 +1539,18 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await stRSR.connect(addr1).stake(stake)
 
       // Advance to get 100 rounds of rewards
-      await advanceTime(100 * Number(config.rewardPeriod) + 1)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 100)
 
       // Calculate payout amount as if it were a closed form calculation from start
       const addedRSRStake = amountAdded.sub(decayFn(amountAdded, 100))
-      const newRate: BigNumber = fp(stake).div(stake.add(addedRSRStake))
+      const newRate: BigNumber = fp(stake.add(addedRSRStake)).add(stake.div(2)).div(stake)
 
       // Payout rewards
       await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
-      const error = calcErr(100)
+      // const error = calcErr(100)
+      const error = 100
 
-      // Check exchange rate is lower by at-most half
+      // Check exchange rate is greater by at-most half
       expect((await stRSR.exchangeRate()).sub(newRate).abs()).to.be.lte(error)
 
       // Check new balances and stakes
@@ -1174,27 +1568,29 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       const prevPoolBalance: BigNumber = await rsr.balanceOf(stRSR.address)
 
       await whileImpersonating(basketHandler.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(amount)).to.be.revertedWith(
-          'not backing manager'
-        )
+        await expect(stRSR.connect(signer).seizeRSR(amount)).to.be.revertedWith('!bm')
       })
       expect(await rsr.balanceOf(stRSR.address)).to.equal(prevPoolBalance)
 
-      await expect(stRSR.connect(other).seizeRSR(amount)).to.be.revertedWith('not backing manager')
+      await expect(stRSR.connect(other).seizeRSR(amount)).to.be.revertedWith('!bm')
       expect(await rsr.balanceOf(stRSR.address)).to.equal(prevPoolBalance)
     })
 
     it('Should not allow to remove RSR if paused', async () => {
-      await main.connect(owner).pause()
+      await main.connect(owner).pauseTrading()
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(1)).to.be.revertedWith('paused or frozen')
+        await expect(stRSR.connect(signer).seizeRSR(1)).to.be.revertedWith(
+          'frozen or trading paused'
+        )
       })
     })
 
     it('Should not allow to remove RSR if frozen', async () => {
       await main.connect(owner).freezeShort()
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(1)).to.be.revertedWith('paused or frozen')
+        await expect(stRSR.connect(signer).seizeRSR(1)).to.be.revertedWith(
+          'frozen or trading paused'
+        )
       })
     })
 
@@ -1203,9 +1599,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       const prevPoolBalance: BigNumber = await rsr.balanceOf(stRSR.address)
 
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(zero)).to.be.revertedWith(
-          'Amount cannot be zero'
-        )
+        await expect(stRSR.connect(signer).seizeRSR(zero)).to.be.revertedWith('zero amount')
       })
 
       expect(await rsr.balanceOf(stRSR.address)).to.equal(prevPoolBalance)
@@ -1217,7 +1611,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       await whileImpersonating(backingManager.address, async (signer) => {
         await expect(stRSR.connect(signer).seizeRSR(amount)).to.be.revertedWith(
-          'Cannot seize more RSR than we hold'
+          'seize exceeds balance'
         )
       })
 
@@ -1239,14 +1633,14 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
 
       // new rate: new strsr supply / RSR backing that strsr supply
-      const newRate = fp(amount).div(amount.sub(amount2))
+      const newRate = fp(amount.sub(amount2)).div(amount)
 
       // Seize RSR
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(amount2))
-          .to.emit(stRSR, 'ExchangeRateSet')
-          .withArgs(fp('1'), newRate)
+        await expect(stRSR.connect(signer).seizeRSR(amount2)).to.emit(stRSR, 'ExchangeRateSet')
       })
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newRate)
 
       // Check balances and stakes
       expect(await rsr.balanceOf(stRSR.address)).to.equal(amount.sub(amount2))
@@ -1318,14 +1712,14 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
       expect(await stRSR.balanceOf(addr2.address)).to.equal(amount)
 
-      const newRate = fp(amount.mul(2)).div(amount.mul(2).sub(amount2))
+      const newRate = fp(amount.mul(2).sub(amount2)).div(amount.mul(2))
 
       // Seize RSR
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(amount2))
-          .to.emit(stRSR, 'ExchangeRateSet')
-          .withArgs(fp('1'), newRate)
+        await expect(stRSR.connect(signer).seizeRSR(amount2)).to.emit(stRSR, 'ExchangeRateSet')
       })
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newRate)
 
       // Check balances and stakes
       expect(await rsr.balanceOf(stRSR.address)).to.equal(amount.mul(2).sub(amount2))
@@ -1361,14 +1755,15 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr2.address)).to.equal(amount)
       expect(await stRSR.balanceOf(addr3.address)).to.equal(amount)
 
-      const newRate = fp(amount.mul(3)).div(amount.mul(3).sub(amount2))
+      const newRate = fp(amount.mul(3).sub(amount2)).div(amount.mul(3))
 
       // Seize RSR
       await whileImpersonating(backingManager.address, async (signer) => {
-        await expect(stRSR.connect(signer).seizeRSR(amount2))
-          .to.emit(stRSR, 'ExchangeRateSet')
-          .withArgs(fp('1'), newRate)
+        await expect(stRSR.connect(signer).seizeRSR(amount2)).to.emit(stRSR, 'ExchangeRateSet')
       })
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newRate)
+
       // Check balances and stakes
       expect(await rsr.balanceOf(stRSR.address)).to.equal(amount.mul(3).sub(amount2))
       expect(await stRSR.totalSupply()).to.equal(amount.mul(3))
@@ -1484,7 +1879,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await whileImpersonating(backingManager.address, async (signer) => {
         await expect(stRSR.connect(signer).seizeRSR(toSeize))
           .to.emit(stRSR, 'ExchangeRateSet')
-          .withArgs(fp('1'), fp('1e9'))
+          .withArgs(fp('1'), fp('1e-9'))
       })
 
       // Check balances and stakes
@@ -1495,7 +1890,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
       expect(await stRSR.balanceOf(addr2.address)).to.equal(0)
       await expectWithdrawal(addr2.address, 0, { rsrAmount: dustAmt.div(2) })
-      expect(await stRSR.exchangeRate()).to.equal(fp('1e9'))
+      expect(await stRSR.exchangeRate()).to.equal(fp('1e-9'))
     })
 
     it('Should remove RSR from Withdrawers', async () => {
@@ -1590,7 +1985,303 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await rsr.balanceOf(addr2.address)).to.equal(initialBal.sub(amount))
       expect(await stRSR.balanceOf(addr1.address)).to.equal(0)
       expect(await stRSR.balanceOf(addr2.address)).to.equal(amount)
-      expect(await stRSR.exchangeRate()).to.equal(fp(double).div(double.sub(amount2)))
+      const newExchangeRate = fp(double.sub(amount2)).div(double)
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newExchangeRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(newExchangeRate)
+    })
+
+    it('Should handle small unstake after a significant RSR seizure', async () => {
+      stkWithdrawalDelay = bn(await stRSR.unstakingDelay()).toNumber()
+
+      const amount: BigNumber = bn('1e9')
+      const one: BigNumber = bn('1')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, amount)
+      await stRSR.connect(addr1).stake(amount)
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount)
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(await stRSR.totalSupply())
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
+
+      // Seize most of the RSR
+      await whileImpersonating(backingManager.address, async (signer) => {
+        await expect(stRSR.connect(signer).seizeRSR(amount.sub(one)))
+          .to.emit(stRSR, 'ExchangeRateSet')
+          .withArgs(fp('1'), fp('1e-9'))
+      })
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(one)
+      expect(await stRSR.totalSupply()).to.equal(amount)
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
+
+      // Check new rate
+      expect(await stRSR.exchangeRate()).to.equal(fp('1e-9'))
+
+      // Unstake 1 stRSR with user 1
+      const availableAt = (await getLatestBlockTimestamp()) + config.unstakingDelay.toNumber() + 1
+      // Set next block timestamp - for deterministic result
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+
+      await expect(stRSR.connect(addr1).unstake(one))
+        .emit(stRSR, 'UnstakingStarted')
+        .withArgs(0, 2, addr1.address, bn(0), one, availableAt)
+
+      // Check withdrawal properly registered - Check draft era
+      //await expectWithdrawal(addr1.address, 0, { rsrAmount: bn(1) })
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(one)
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
+
+      // All staked funds withdrawn upfront
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.sub(one))
+      expect(await stRSR.totalSupply()).to.equal(amount.sub(one))
+
+      // Move forward past stakingWithdrawalDelay
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+      // Withdraw
+      await stRSR.connect(addr1).withdraw(addr1.address, 1)
+
+      // Check balances and stakes - Nothing was transferred
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(one)
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount))
+
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.sub(one))
+      expect(await stRSR.totalSupply()).to.equal(amount.sub(one))
+    })
+
+    it('Should handle cancel unstake after a significant RSR seizure', async () => {
+      stkWithdrawalDelay = bn(await stRSR.unstakingDelay()).toNumber()
+
+      const unstakeAmount: BigNumber = fp('1e-9')
+      const amount: BigNumber = bn('1e18').add(unstakeAmount).add(1)
+
+      // Stake enough for 2 unstakings
+      await rsr.connect(addr1).approve(stRSR.address, amount.add(1))
+      await stRSR.connect(addr1).stake(amount.add(1))
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount.add(1))
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(await stRSR.totalSupply())
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount.add(1)))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.add(1))
+
+      // Unstake twice
+      const availableAt = (await getLatestBlockTimestamp()) + config.unstakingDelay.toNumber() + 1
+      // Set next block timestamp - for deterministic result
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+
+      await expect(stRSR.connect(addr1).unstake(1))
+        .emit(stRSR, 'UnstakingStarted')
+        .withArgs(0, 1, addr1.address, 1, 1, availableAt)
+      await expect(stRSR.connect(addr1).unstake(unstakeAmount))
+        .emit(stRSR, 'UnstakingStarted')
+        .withArgs(1, 1, addr1.address, unstakeAmount, unstakeAmount, availableAt + 1)
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(amount.add(1))
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount.add(1)))
+
+      // All staked funds withdrawn upfront
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.sub(unstakeAmount))
+      expect(await stRSR.totalSupply()).to.equal(amount.sub(unstakeAmount))
+
+      // Rate does not change
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+
+      // Seize most of the RSR
+      const seizeAmt = fp('0.99999999').mul(amount).div(fp('1')).add(1)
+      const exchangeRate = fp('1e-8')
+      await whileImpersonating(backingManager.address, async (signer) => {
+        await expect(stRSR.connect(signer).seizeRSR(seizeAmt)).to.emit(stRSR, 'ExchangeRateSet')
+      })
+
+      // Check new rate
+      expect(await stRSR.exchangeRate()).to.be.closeTo(exchangeRate, bn(10))
+
+      // Check balances and stakes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(exchangeRate.add(10))
+      expect(await stRSR.totalSupply()).to.equal(amount.sub(unstakeAmount))
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount.add(1)))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.sub(unstakeAmount))
+
+      // Move forward past stakingWithdrawalDelay
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + stkWithdrawalDelay)
+
+      // Cancel the larger unstake -- should round down to 0
+      await stRSR.connect(addr1).cancelUnstake(1)
+
+      // Check balances and stakes - No changes
+      expect(await rsr.balanceOf(stRSR.address)).to.equal(exchangeRate.add(10))
+      expect(await stRSR.totalSupply()).to.equal(amount.sub(unstakeAmount))
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount.add(1)))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount.sub(unstakeAmount))
+    })
+
+    it('Should not allow stakeRate manipulation', async () => {
+      // send RSR to stRSR (attempt to manipulate stake rate)
+      await rsr.connect(addr1).transfer(stRSR.address, fp('200'))
+      const attackerBalBefore = await rsr.balanceOf(addr1.address)
+      const stakerBalBefore = await rsr.balanceOf(addr2.address)
+
+      // stake 1 wei
+      await rsr.connect(addr1).approve(stRSR.address, bn(1))
+      await stRSR.connect(addr1).stake(bn(1))
+
+      // wait, then payout rewards
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 12)
+      const preExRate = await stRSR.exchangeRate()
+      await stRSR.payoutRewards()
+      const postExRate = await stRSR.exchangeRate()
+      expect(postExRate).eq(preExRate)
+
+      // addr2 stakes
+      const stakeAmt = fp('10')
+      await rsr.connect(addr2).approve(stRSR.address, stakeAmt)
+      await stRSR.connect(addr2).stake(stakeAmt)
+      const addr2Bal = await stRSR.balanceOf(addr2.address)
+      expect(addr2Bal).to.eq(stakeAmt)
+
+      // attacker unstakes
+      const unstakingDelay = await stRSR.unstakingDelay()
+      await stRSR.connect(addr1).unstake(bn(1))
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + unstakingDelay)
+      await stRSR.connect(addr1).withdraw(addr1.address, 1)
+      const attackerBalAfter = await rsr.balanceOf(addr1.address)
+      expect(attackerBalAfter).closeTo(attackerBalBefore, bn(10))
+
+      // staker unstakes
+      await stRSR.connect(addr2).unstake(addr2Bal)
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + unstakingDelay)
+      await stRSR.connect(addr2).withdraw(addr2.address, 1)
+      const stakerBalAFter = await rsr.balanceOf(addr2.address)
+      expect(stakerBalAFter).to.be.gt(stakerBalBefore)
+    })
+  })
+
+  describe('Reset Stakes - Governance', () => {
+    it('Should not allow to reset stakes if not governance', async () => {
+      await expect(stRSR.connect(other).resetStakes()).to.be.revertedWith('governance only')
+    })
+
+    it('Should reset stakes and perform validations on rate - MAX', async () => {
+      const stakeAmt: BigNumber = bn('100e18')
+      const seizeAmt: BigNumber = bn('1e18')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, stakeAmt)
+      await stRSR.connect(addr1).stake(stakeAmt)
+
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+      expect(await stRSR.totalSupply()).to.equal(stakeAmt)
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stakeAmt)
+
+      // Cannot reset stakes with this rate
+      await expect(stRSR.connect(owner).resetStakes()).to.be.revertedWith('rate still safe')
+
+      // Seize small portion of RSR to increase stake rate - still safe
+      await whileImpersonating(backingManager.address, async (signer) => {
+        await expect(stRSR.connect(signer).seizeRSR(seizeAmt)).to.emit(stRSR, 'ExchangeRateSet')
+      })
+
+      // new rate: new strsr supply / RSR backing that strsr supply
+      let expectedRate = fp(stakeAmt.sub(seizeAmt)).div(stakeAmt)
+      expect(await stRSR.exchangeRate()).to.be.closeTo(expectedRate, 1)
+      expect(await stRSR.totalSupply()).to.equal(stakeAmt)
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stakeAmt)
+
+      // Attempt to reset stakes, still not possible
+      await expect(stRSR.connect(owner).resetStakes()).to.be.revertedWith('rate still safe')
+
+      // New Seizure - rate will be unsafe
+      const rsrRemaining = stakeAmt.sub(seizeAmt)
+      const seizeAmt2 = rsrRemaining.sub(1e13)
+      await whileImpersonating(backingManager.address, async (signer) => {
+        await expect(stRSR.connect(signer).seizeRSR(seizeAmt2)).to.emit(stRSR, 'ExchangeRateSet')
+      })
+
+      // check new rate
+      expectedRate = fp(stakeAmt.sub(seizeAmt).sub(seizeAmt2)).div(stakeAmt)
+      expect(await stRSR.exchangeRate()).to.be.closeTo(expectedRate, 1)
+      expect(await stRSR.exchangeRate()).to.be.lte(fp('1e-6'))
+      expect(await stRSR.exchangeRate()).to.be.gte(fp('1e-9'))
+
+      // Now governance can reset stakes
+      await expect(stRSR.connect(owner).resetStakes()).to.emit(stRSR, 'AllBalancesReset')
+
+      // All stakes reset
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+      expect(await stRSR.totalSupply()).to.equal(bn(0))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(bn(0))
+    })
+
+    it('Should reset stakes and perform validations on rate - MIN', async () => {
+      const stakeAmt: BigNumber = bn('1000e18')
+      const addAmt1: BigNumber = bn('100e18')
+      const addAmt2: BigNumber = bn('120e30')
+
+      // Stake
+      await rsr.connect(addr1).approve(stRSR.address, stakeAmt)
+      await stRSR.connect(addr1).stake(stakeAmt)
+
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+      expect(await stRSR.totalSupply()).to.equal(stakeAmt)
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stakeAmt)
+
+      // Cannot reset stakes with this rate
+      await expect(stRSR.connect(owner).resetStakes()).to.be.revertedWith('rate still safe')
+
+      // Add RSR to decrease stake rate - still safe
+      await rsr.connect(owner).transfer(stRSR.address, addAmt1)
+
+      // Advance to the end of noop period
+      await advanceToTimestamp((await getLatestBlockTimestamp()) + 1)
+      await stRSR.payoutRewards()
+
+      // Calculate payout amount
+      const decayFn = makeDecayFn(await stRSR.rewardRatio())
+      const addedRSRStake = addAmt1.sub(decayFn(addAmt1, 1)) // 1 round
+      const newRate: BigNumber = fp(stakeAmt.add(addedRSRStake)).div(stakeAmt)
+
+      // Payout rewards - Advance to get 1 round of rewards
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+      await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
+      expect(await stRSR.exchangeRate()).to.be.closeTo(newRate, 1)
+      expect(await stRSR.totalSupply()).to.equal(stakeAmt)
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stakeAmt)
+
+      // Attempt to reset stakes, still not possible
+      await expect(stRSR.connect(owner).resetStakes()).to.be.revertedWith('rate still safe')
+
+      // Add a large amount of funds - rate will be unsafe
+      await rsr.connect(owner).mint(owner.address, addAmt2)
+      await rsr.connect(owner).transfer(stRSR.address, addAmt2)
+
+      // Advance to the end of noop period
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+      await stRSR.payoutRewards()
+
+      // Payout rewards - Advance time - rate will be unsafe
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 100)
+      await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
+      expect(await stRSR.exchangeRate()).to.be.gte(fp('1e6'))
+      expect(await stRSR.exchangeRate()).to.be.lte(fp('1e9'))
+      expect(await stRSR.totalSupply()).to.equal(stakeAmt)
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(stakeAmt)
+
+      // Now governance can reset stakes
+      await expect(stRSR.connect(owner).resetStakes()).to.emit(stRSR, 'AllBalancesReset')
+
+      // All stakes reset
+      expect(await stRSR.exchangeRate()).to.equal(fp('1'))
+      expect(await stRSR.totalSupply()).to.equal(bn(0))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(bn(0))
     })
   })
 
@@ -1628,7 +2319,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       //  Perform transfer with user with no stake
       await expect(stRSR.connect(addr2).transfer(addr1.address, amount)).to.be.revertedWith(
-        'ERC20: transfer amount exceeds balance'
+        'insufficient balance'
       )
 
       // Nothing transferred
@@ -1645,13 +2336,13 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       // Attempt to send to zero address
       await expect(stRSR.connect(addr1).transfer(ZERO_ADDRESS, amount)).to.be.revertedWith(
-        'ERC20: transfer to the zero address'
+        'zero address'
       )
 
       // Attempt to send from zero address - Impersonation is the only way to get to this validation
       await whileImpersonating(ZERO_ADDRESS, async (signer) => {
         await expect(stRSR.connect(signer).transfer(addr2.address, amount)).to.be.revertedWith(
-          'ERC20: transfer from the zero address'
+          'zero address'
         )
       })
 
@@ -1660,6 +2351,19 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.balanceOf(addr2.address)).to.equal(addr2BalancePrev)
       expect(await stRSR.totalSupply()).to.equal(totalSupplyPrev)
       expect(await rsr.balanceOf(stRSR.address)).to.equal(amount)
+    })
+
+    it('Should not allow transfer/transferFrom to address(this)', async () => {
+      // transfer
+      await expect(stRSR.connect(addr1).transfer(stRSR.address, 1)).to.be.revertedWith(
+        'transfer to self'
+      )
+
+      // transferFrom
+      await stRSR.connect(addr1).approve(addr2.address, 1)
+      await expect(
+        stRSR.connect(addr2).transferFrom(addr1.address, stRSR.address, 1)
+      ).to.be.revertedWith('transfer to self')
     })
 
     it('Should transferFrom stakes between accounts', async function () {
@@ -1687,7 +2391,12 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       const permit = await signERC2612Permit(
         addr1,
-        stRSR.address,
+        {
+          name: await stRSR.name(),
+          version: VERSION,
+          chainId: await getChainId(hre),
+          verifyingContract: stRSR.address,
+        },
         addr1.address,
         addr2.address,
         amount.toString()
@@ -1715,7 +2424,12 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Set invalid signature
       const permit = await signERC2612Permit(
         addr1,
-        stRSR.address,
+        {
+          name: await stRSR.name(),
+          version: VERSION,
+          chainId: await getChainId(hre),
+          verifyingContract: stRSR.address,
+        },
         addr1.address,
         addr2.address,
         amount.add(1).toString()
@@ -1750,6 +2464,66 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.allowance(addr1.address, addr2.address)).to.equal(0)
     })
 
+    describe('ERC1271 #fast', () => {
+      let erc1271Mock: ERC1271Mock
+
+      beforeEach(async () => {
+        const ERC1271Factory = await ethers.getContractFactory('ERC1271Mock')
+        erc1271Mock = await ERC1271Factory.deploy()
+
+        // Give StRSR balance to ERC1271Mock
+        await stRSR.connect(addr1).transfer(erc1271Mock.address, amount)
+      })
+
+      it('should not permit without ERC1271 support', async () => {
+        // Try a smart contract that does not support ERC1271
+        await expect(
+          stRSR.permit(
+            main.address,
+            addr1.address,
+            amount,
+            bn(2).pow(255),
+            0,
+            ethers.utils.formatBytes32String(''),
+            ethers.utils.formatBytes32String('')
+          )
+        ).to.be.reverted
+        expect(await stRSR.allowance(main.address, addr1.address)).to.equal(0)
+
+        // Try the ERC1271Mock with approvals turned off
+        await expect(
+          stRSR.permit(
+            erc1271Mock.address,
+            addr1.address,
+            amount,
+            bn(2).pow(255),
+            0,
+            ethers.utils.formatBytes32String(''),
+            ethers.utils.formatBytes32String('')
+          )
+        ).to.be.revertedWith('ERC1271: Unauthorized')
+        expect(await stRSR.allowance(erc1271Mock.address, addr1.address)).to.equal(0)
+      })
+
+      it('should permit spend with ERC1271 support', async () => {
+        // ERC1271 with approvals turned on
+        await erc1271Mock.enableApprovals()
+        await stRSR.permit(
+          erc1271Mock.address,
+          addr1.address,
+          amount,
+          bn(2).pow(255),
+          0,
+          ethers.utils.formatBytes32String(''),
+          ethers.utils.formatBytes32String('')
+        )
+        expect(await stRSR.allowance(erc1271Mock.address, addr1.address)).to.equal(amount)
+        await stRSR.connect(addr1).transferFrom(erc1271Mock.address, addr1.address, amount)
+        expect(await stRSR.balanceOf(erc1271Mock.address)).to.equal(0)
+        expect(await stRSR.balanceOf(addr1.address)).to.equal(amount)
+      })
+    })
+
     it('Should not transferFrom stakes if no allowance', async function () {
       const addr1BalancePrev = await stRSR.balanceOf(addr1.address)
       const addr2BalancePrev = await stRSR.balanceOf(addr2.address)
@@ -1759,7 +2533,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSR.allowance(addr1.address, addr2.address)).to.equal(0)
       await expect(
         stRSR.connect(addr2).transferFrom(addr1.address, other.address, amount)
-      ).to.be.revertedWith('ERC20: insufficient allowance')
+      ).to.be.revertedWith('insufficient allowance')
 
       // Nothing transferred
       expect(await stRSR.balanceOf(addr1.address)).to.equal(addr1BalancePrev)
@@ -1775,13 +2549,13 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       // Attempt to set allowance to zero address
       await expect(stRSR.connect(addr1).approve(ZERO_ADDRESS, amount)).to.be.revertedWith(
-        'ERC20: approve to the zero address'
+        'zero address'
       )
 
       // Attempt set allowance from zero address - Impersonation is the only way to get to this validation
       await whileImpersonating(ZERO_ADDRESS, async (signer) => {
         await expect(stRSR.connect(signer).approve(addr2.address, amount)).to.be.revertedWith(
-          'ERC20: approve from the zero address'
+          'zero address'
         )
       })
 
@@ -1817,7 +2591,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Should not allow to decrease below zero
       await expect(
         stRSR.connect(addr1).decreaseAllowance(addr2.address, amount.add(1))
-      ).to.be.revertedWith('ERC20: decreased allowance below zero')
+      ).to.be.revertedWith('decrease allowance')
 
       // No changes
       expect(await stRSR.allowance(addr1.address, addr2.address)).to.equal(amount)
@@ -1838,27 +2612,6 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       // Remains the same
       expect(await stRSR.allowance(addr1.address, addr2.address)).to.equal(MAX_UINT256)
-    })
-  })
-
-  describeP1('Name and Symbol', () => {
-    it('Should allow to set name/symbol if Owner', async () => {
-      // Setup new values
-      const newName = 'newSTRSR Token'
-      const newSymbol = 'newSTRSR'
-
-      // Update name and symbol
-      await stRSR.connect(owner).setName(newName)
-      await stRSR.connect(owner).setSymbol(newSymbol)
-
-      expect(await stRSR.name()).to.equal(newName)
-      expect(await stRSR.symbol()).to.equal(newSymbol)
-
-      // Try to update again if not owner
-      await expect(stRSR.connect(addr1).setName('randomName')).to.be.revertedWith('governance only')
-      await expect(stRSR.connect(addr1).setSymbol('randomSymbol')).to.be.revertedWith(
-        'governance only'
-      )
     })
   })
 
@@ -1923,13 +2676,12 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       const expiry = MAX_UINT256
       const chainId = await getChainId(hre)
       const name = await stRSRVotes.name()
-      const version = '1'
       const verifyingContract = stRSRVotes.address
 
       // Get data
       const buildData = {
         types: { Delegation },
-        domain: { name, version, chainId, verifyingContract },
+        domain: { name, version: VERSION, chainId, verifyingContract },
         message: {
           delegatee: addr1.address,
           nonce,
@@ -1966,13 +2718,12 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       const expiry = MAX_UINT256
       const chainId = await getChainId(hre)
       const name = await stRSRVotes.name()
-      const version = '1'
       const verifyingContract = stRSRVotes.address
 
       // Get data
       const buildData = {
         types: { Delegation },
-        domain: { name, version, chainId, verifyingContract },
+        domain: { name, version: VERSION, chainId, verifyingContract },
         message: {
           delegatee: addr1.address,
           nonce: invalidNonce,
@@ -1987,7 +2738,21 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Attempt to delegate with invalid nonce
       await expect(
         stRSRVotes.connect(other).delegateBySig(addr1.address, invalidNonce, expiry, v, r, s)
-      ).to.be.revertedWith('ERC20Votes: invalid nonce')
+      ).to.be.revertedWith('invalid nonce')
+
+      // Attempt to delegate with invalid signature
+      await expect(
+        stRSRVotes
+          .connect(other)
+          .delegateBySig(
+            addr1.address,
+            nonce,
+            expiry,
+            28,
+            '0x91d1478d8d0aaaafc8cf58fc0c9c1e95a07a78baa730de72981407d3344ddb5d',
+            '0x1d33a68b1b1aaaa5ed119bb71ad14e21c5168120c18700eb1411d6640d1b3d76'
+          )
+      ).to.be.revertedWith('ECDSA: invalid signature')
 
       // Set invalid expiration
       const invalidExpiry = bn(await getLatestBlockNumber())
@@ -1997,10 +2762,102 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Attempt to delegate with invalid expiry
       await expect(
         stRSRVotes.connect(other).delegateBySig(addr1.address, nonce, invalidExpiry, v, r, s)
-      ).to.be.revertedWith('ERC20Votes: signature expired')
+      ).to.be.revertedWith('signature expired')
 
       // Check result - No delegates
       expect(await stRSRVotes.delegates(addr1.address)).to.equal(ZERO_ADDRESS)
+    })
+
+    it('Should use independent nonces for permit and delegation', async function () {
+      // Check no delegate
+      expect(await stRSRVotes.delegates(addr1.address)).to.equal(ZERO_ADDRESS)
+
+      const amount = bn('10e18')
+
+      const permit = await signERC2612Permit(
+        addr1,
+        {
+          name: await stRSR.name(),
+          version: VERSION,
+          chainId: await getChainId(hre),
+          verifyingContract: stRSR.address,
+        },
+        addr1.address,
+        addr2.address,
+        amount.toString()
+      )
+
+      await expect(
+        stRSR.permit(
+          addr1.address,
+          addr2.address,
+          amount,
+          permit.deadline,
+          permit.v,
+          permit.r,
+          permit.s
+        )
+      )
+        .to.emit(stRSR, 'Approval')
+        .withArgs(addr1.address, addr2.address, amount)
+
+      expect(await stRSR.allowance(addr1.address, addr2.address)).to.equal(amount)
+
+      const Delegation = [
+        { name: 'delegatee', type: 'address' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'expiry', type: 'uint256' },
+      ]
+
+      const chainId = await getChainId(hre)
+      const expiry = MAX_UINT256
+      const name = await stRSRVotes.name()
+      const verifyingContract = stRSRVotes.address
+
+      const nonce1 = await stRSRVotes.nonces(addr1.address)
+
+      const sig1 = ethers.utils.splitSignature(
+        await addr1._signTypedData(
+          { name, version: VERSION, chainId, verifyingContract },
+          { Delegation },
+          {
+            delegatee: addr1.address,
+            nonce: nonce1,
+            expiry,
+          }
+        )
+      )
+
+      // Change delegate for addr1 using signature with bad nonce
+      await expect(
+        stRSRVotes
+          .connect(other)
+          .delegateBySig(addr1.address, nonce1, expiry, sig1.v, sig1.r, sig1.s)
+      ).to.be.revertedWith('invalid nonce')
+
+      const nonce2 = await stRSRVotes.delegationNonces(addr1.address)
+
+      const sig2 = ethers.utils.splitSignature(
+        await addr1._signTypedData(
+          { name, version: VERSION, chainId, verifyingContract },
+          { Delegation },
+          {
+            delegatee: addr1.address,
+            nonce: nonce2,
+            expiry,
+          }
+        )
+      )
+
+      // Change delegate for addr1 using signature with good nonce
+      await expect(
+        stRSRVotes
+          .connect(other)
+          .delegateBySig(addr1.address, nonce2, expiry, sig2.v, sig2.r, sig2.s)
+      ).to.not.be.reverted
+
+      // Check result
+      expect(await stRSRVotes.delegates(addr1.address)).to.equal(addr1.address)
     })
 
     it('Should count votes properly when staking', async function () {
@@ -2012,25 +2869,25 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Check checkpoint
       expect(await stRSRVotes.numCheckpoints(addr1.address)).to.equal(0)
 
-      // Advance block
-      await advanceBlocks(1)
+      // Advance time
+      await advanceTime(1)
 
       // Check new values - Still zero for addr1, requires delegation
-      let currentBlockNumber = (await getLatestBlockNumber()) - 1
-      expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount1)
-      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(0)
+      let currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(0)
       expect(await stRSRVotes.getVotes(addr1.address)).to.equal(0)
-      expect(await stRSRVotes.getPastEra(currentBlockNumber)).to.equal(1)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
 
       // Cannot check votes on future block
-      await expect(stRSRVotes.getPastTotalSupply(currentBlockNumber + 1)).to.be.revertedWith(
-        'ERC20Votes: block not yet mined'
+      await expect(stRSRVotes.getPastTotalSupply(currentBlockTimestamp + 1)).to.be.revertedWith(
+        'future lookup'
       )
       await expect(
-        stRSRVotes.getPastVotes(addr1.address, currentBlockNumber + 1)
-      ).to.be.revertedWith('ERC20Votes: block not yet mined')
-      await expect(stRSRVotes.getPastEra(currentBlockNumber + 1)).to.be.revertedWith(
-        'ERC20Votes: block not yet mined'
+        stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp + 1)
+      ).to.be.revertedWith('future lookup')
+      await expect(stRSRVotes.getPastEra(currentBlockTimestamp + 1)).to.be.revertedWith(
+        'future lookup'
       )
 
       // Delegate votes
@@ -2039,20 +2896,20 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Check checkpoint stored
       expect(await stRSRVotes.numCheckpoints(addr1.address)).to.equal(1)
       expect(await stRSRVotes.checkpoints(addr1.address, 0)).to.eql([
-        await getLatestBlockNumber(),
+        await getLatestBlockTimestamp(),
         amount1,
       ])
 
-      // Advance block
-      await advanceBlocks(1)
+      // Advance time
+      await advanceTime(1)
 
       // Check new values - Now properly counted
-      currentBlockNumber = (await getLatestBlockNumber()) - 1
-      expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount1)
-      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount1)
-      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(0)
-      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
-      expect(await stRSRVotes.getPastEra(currentBlockNumber)).to.equal(1)
+      currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
 
       // Check current votes
       expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
@@ -2068,20 +2925,22 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Check checkpoint stored
       expect(await stRSRVotes.numCheckpoints(addr2.address)).to.equal(1)
       expect(await stRSRVotes.checkpoints(addr2.address, 0)).to.eql([
-        await getLatestBlockNumber(),
+        await getLatestBlockTimestamp(),
         amount2,
       ])
 
-      // Advance block
-      await advanceBlocks(1)
+      // Advance time
+      await advanceTime(1)
 
       // Check new values - Couting votes for addr2
-      currentBlockNumber = (await getLatestBlockNumber()) - 1
-      expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount1.add(amount2))
-      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount1)
-      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount2)
-      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
-      expect(await stRSRVotes.getPastEra(currentBlockNumber)).to.equal(1)
+      currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(
+        amount1.add(amount2)
+      )
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount2)
+      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
 
       // Check current votes
       expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
@@ -2098,7 +2957,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Check checkpoints stored
       expect(await stRSRVotes.numCheckpoints(addr2.address)).to.equal(2)
       expect(await stRSRVotes.checkpoints(addr2.address, 1)).to.eql([
-        await getLatestBlockNumber(),
+        await getLatestBlockTimestamp(),
         amount2.add(amount3),
       ])
       expect(await stRSRVotes.numCheckpoints(addr3.address)).to.equal(0)
@@ -2107,21 +2966,131 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await advanceBlocks(1)
 
       // Check new values - Delegated votes from addr3 count for addr2
-      currentBlockNumber = (await getLatestBlockNumber()) - 1
-      expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(
+      currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(
         amount1.add(amount2).add(amount3)
       )
-      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount1)
-      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(
         amount2.add(amount3)
       )
-      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
-      expect(await stRSRVotes.getPastEra(currentBlockNumber)).to.equal(1)
+      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
 
       // Check current votes
       expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
       expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount2.add(amount3))
       expect(await stRSRVotes.getVotes(addr3.address)).to.equal(0)
+    })
+
+    it('Should allow to stake and delegate in single transaction', async function () {
+      // Should perform basic validations on stake
+      await expect(
+        stRSRVotes.connect(addr1).stakeAndDelegate(bn(0), ZERO_ADDRESS)
+      ).to.be.revertedWith('zero amount')
+
+      expect(await stRSRVotes.delegates(addr1.address)).to.equal(ZERO_ADDRESS)
+
+      // Perform some stakes - delegate to self
+      const amount1: BigNumber = bn('50e18')
+      await rsr.connect(addr1).approve(stRSRVotes.address, amount1)
+      await expect(stRSRVotes.connect(addr1).stakeAndDelegate(amount1, ZERO_ADDRESS)).to.emit(
+        stRSRVotes,
+        'Staked'
+      )
+
+      // Check deposit registered
+      expect(await rsr.balanceOf(stRSRVotes.address)).to.equal(amount1)
+      expect(await rsr.balanceOf(addr1.address)).to.equal(initialBal.sub(amount1))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(amount1)
+
+      // Check checkpoint stored - no need to delegate again
+      expect(await stRSRVotes.delegates(addr1.address)).to.equal(addr1.address)
+      expect(await stRSRVotes.numCheckpoints(addr1.address)).to.equal(1)
+      expect(await stRSRVotes.checkpoints(addr1.address, 0)).to.eql([
+        await getLatestBlockTimestamp(),
+        amount1,
+      ])
+
+      // Advance block
+      await advanceBlocks(1)
+
+      // Check new values - Now properly counted
+      let currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
+
+      // Check current votes
+      expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
+
+      // Perform some stakes with another user, delegate to a third address
+      expect(await stRSRVotes.delegates(addr2.address)).to.equal(ZERO_ADDRESS)
+
+      const amount2: BigNumber = bn('40e18')
+      await rsr.connect(addr2).approve(stRSRVotes.address, amount2)
+      await stRSRVotes.connect(addr2).stakeAndDelegate(amount2, addr3.address)
+
+      // Check deposit registered
+      expect(await rsr.balanceOf(stRSRVotes.address)).to.equal(amount1.add(amount2))
+      expect(await rsr.balanceOf(addr2.address)).to.equal(initialBal.sub(amount2))
+      expect(await stRSR.balanceOf(addr2.address)).to.equal(amount2)
+
+      // Check checkpoint stored for delegatee correctly
+      expect(await stRSRVotes.delegates(addr2.address)).to.equal(addr3.address)
+      expect(await stRSRVotes.numCheckpoints(addr3.address)).to.equal(1)
+      expect(await stRSRVotes.checkpoints(addr3.address, 0)).to.eql([
+        await getLatestBlockTimestamp(),
+        amount2,
+      ])
+
+      // Advance time
+      await advanceTime(1)
+
+      // Check new values - Counting votes for addr3
+      currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(
+        amount1.add(amount2)
+      )
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount1)
+      expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(0)
+      expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(amount2)
+      expect(await stRSRVotes.getPastEra(currentBlockTimestamp)).to.equal(1)
+
+      // Check current votes
+      expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
+      expect(await stRSRVotes.getVotes(addr2.address)).to.equal(0)
+      expect(await stRSRVotes.getVotes(addr3.address)).to.equal(amount2)
+
+      // By passing the zero address it keeps current delegate (if one defined already)
+      const amount3: BigNumber = bn('10e18')
+      await rsr.connect(addr2).approve(stRSRVotes.address, amount3)
+      await stRSRVotes.connect(addr2).stakeAndDelegate(amount3, ZERO_ADDRESS)
+
+      // Delegate remains the same
+      expect(await stRSRVotes.delegates(addr2.address)).to.equal(addr3.address)
+
+      // Check deposit registered
+      expect(await rsr.balanceOf(stRSRVotes.address)).to.equal(amount1.add(amount2).add(amount3))
+      expect(await rsr.balanceOf(addr2.address)).to.equal(initialBal.sub(amount2).sub(amount3))
+      expect(await stRSR.balanceOf(addr2.address)).to.equal(amount2.add(amount3))
+
+      // Check checkpoint stored for delegatee correctly
+      expect(await stRSRVotes.numCheckpoints(addr3.address)).to.equal(2)
+      expect(await stRSRVotes.checkpoints(addr3.address, 1)).to.eql([
+        await getLatestBlockTimestamp(),
+        amount2.add(amount3),
+      ])
+
+      // Advance tim
+      await advanceTime(1)
+
+      // Check current votes
+      expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount1)
+      expect(await stRSRVotes.getVotes(addr2.address)).to.equal(0)
+      expect(await stRSRVotes.getVotes(addr3.address)).to.equal(amount2.add(amount3))
     })
 
     it('Should register single checkpoint per block per account', async function () {
@@ -2137,7 +3106,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       await stRSRVotes.connect(addr1).delegate(addr1.address)
 
       // Mine block
-      await advanceBlocks(1)
+      await advanceTime(1)
 
       // Set automine to true again
       await hre.network.provider.send('evm_setAutomine', [true])
@@ -2145,7 +3114,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Check checkpoints stored - Only one checkpoint
       expect(await stRSRVotes.numCheckpoints(addr1.address)).to.equal(1)
       expect(await stRSRVotes.checkpoints(addr1.address, 0)).to.eql([
-        await getLatestBlockNumber(),
+        await getLatestBlockTimestamp(),
         amount.mul(2),
       ])
 
@@ -2153,17 +3122,17 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount.mul(2))
 
       // Mine an additional block
-      await advanceBlocks(1)
+      await advanceTime(1)
 
-      const currentBlockNumber = (await getLatestBlockNumber()) - 1
-      expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(
+      const currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+      expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+      expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(
         amount.mul(2)
       )
     })
 
     context('With stakes', function () {
-      let currentBlockNumber: number
+      let currentBlockTimestamp: number
       let amount: BigNumber
 
       beforeEach(async function () {
@@ -2180,16 +3149,16 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSRVotes.connect(addr3).delegate(addr3.address)
 
         // Advance block
-        await advanceBlocks(1)
+        await advanceTime(1)
       })
 
       it('Should count votes properly when changing exchange rate', async function () {
         // Check values before changing rate
-        currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr3.address)).to.equal(0)
@@ -2204,24 +3173,24 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await whileImpersonating(backingManager.address, async (signer) => {
           await expect(stRSRVotes.connect(signer).seizeRSR(amount))
             .to.emit(stRSR, 'ExchangeRateSet')
-            .withArgs(fp('1'), fp('2'))
+            .withArgs(fp('1'), fp('0.5'))
         })
 
         // Check balances and stakes
         expect(await stRSRVotes.balanceOf(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.balanceOf(addr2.address)).to.equal(amount)
         expect(await stRSRVotes.balanceOf(addr3.address)).to.equal(0)
-        expect(await stRSRVotes.exchangeRate()).to.equal(fp('2'))
+        expect(await stRSRVotes.exchangeRate()).to.equal(fp('0.5'))
 
         // Advance block
-        await advanceBlocks(1)
+        await advanceTime(1)
 
         // Check values after changing exchange rate
-        currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr3.address)).to.equal(0)
@@ -2231,14 +3200,14 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSRVotes.connect(addr3).stake(amount)
 
         // Advance block
-        await advanceBlocks(1)
+        await advanceTime(1)
 
         // Check values after new stake - final stake counts double
-        currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(4))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(
+        currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(4))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(
           amount.mul(2)
         )
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
@@ -2248,11 +3217,11 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       it('Should track votes properly when changing era', async function () {
         // Check values before changing era
-        let currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        let currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount)
@@ -2272,20 +3241,20 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         expect(await stRSRVotes.exchangeRate()).to.equal(fp('1'))
 
         // Advance block
-        await advanceBlocks(1)
+        await advanceTime(1)
 
         // Should not have retroactively wiped past vote
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         // Check values after changing era
-        currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(0)
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(0)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(0)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(0)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(0)
@@ -2296,23 +3265,23 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSRVotes.connect(addr3).stake(amount)
 
         // Advance block
-        await advanceBlocks(1)
+        await advanceTime(1)
 
         // Check values after new stake - final stake is registered
-        currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(0)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(0)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(amount)
+        currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(amount)
       })
 
       it('Should update votes/checkpoints on transfer', async function () {
         // Check values before transfers
-        const currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        const currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount)
@@ -2328,19 +3297,19 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         // Checkpoints stored
         expect(await stRSRVotes.numCheckpoints(addr1.address)).to.equal(2)
         expect(await stRSRVotes.checkpoints(addr1.address, 1)).to.eql([
-          await getLatestBlockNumber(),
+          await getLatestBlockTimestamp(),
           bn(0),
         ])
         expect(await stRSRVotes.numCheckpoints(addr2.address)).to.equal(2)
         expect(await stRSRVotes.checkpoints(addr2.address, 1)).to.eql([
-          await getLatestBlockNumber(),
+          await getLatestBlockTimestamp(),
           amount.mul(2),
         ])
 
         // Check current voting power has moved, previous values remain for older blocks
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(0)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount.mul(2))
@@ -2349,11 +3318,11 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
 
       it('Should remove voting weight on unstaking', async function () {
         // Check values before transfers
-        const currentBlockNumber = (await getLatestBlockNumber()) - 1
-        expect(await stRSRVotes.getPastTotalSupply(currentBlockNumber)).to.equal(amount.mul(2))
-        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockNumber)).to.equal(amount)
-        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockNumber)).to.equal(0)
+        const currentBlockTimestamp = (await getLatestBlockTimestamp()) - 1
+        expect(await stRSRVotes.getPastTotalSupply(currentBlockTimestamp)).to.equal(amount.mul(2))
+        expect(await stRSRVotes.getPastVotes(addr1.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr2.address, currentBlockTimestamp)).to.equal(amount)
+        expect(await stRSRVotes.getPastVotes(addr3.address, currentBlockTimestamp)).to.equal(0)
 
         expect(await stRSRVotes.getVotes(addr1.address)).to.equal(amount)
         expect(await stRSRVotes.getVotes(addr2.address)).to.equal(amount)
@@ -2371,7 +3340,27 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     })
   })
 
-  describe(`Extreme Bounds (SLOW=${SLOW})`, () => {
+  describe('(regressions)', () => {
+    it('avoids paying revenue to an empty stRSR population', async () => {
+      expect(await stRSR.totalSupply()).to.equal(0)
+
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 600_000)
+      await rsr.mint(stRSR.address, bn('1e18'))
+      // If some RSR rewards have been cooking in stRSR for a while, but no one is there to collect,
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 600_000)
+      await stRSR.payoutRewards()
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 600_000)
+      await stRSR.payoutRewards()
+
+      // Then both totalStakes and stakeRSR should remain 0 after a few payoutRewards() calls
+      // And, so, if someone then stakes a bit, they just get 1:1 stRSR for staked RSR.
+      await rsr.connect(addr1).approve(stRSR.address, bn('1e18'))
+      await stRSR.connect(addr1).stake(bn('1e18'))
+      expect(await stRSR.balanceOf(addr1.address)).to.equal(bn('1e18'))
+    })
+  })
+
+  describeExtreme(`Extreme Bounds ${SLOW ? 'slow mode' : 'fast mode'})`, () => {
     // Dimensions
     //
     // StRSR economics can be broken down into 4 "places" that RSR can be.
@@ -2382,8 +3371,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     //  3. RSR being withdrawn {qRSR}
     //  4. RSR being rewarded {qRSR}
     //  5. Unstaking Delay {seconds}
-    //  6. Reward Period {seconds}
-    //  7. Reward Ratio {%}
+    //  6. Reward Ratio {%}
     //
     //  3^7 = 2187 cases ~= about 2-3min runtime
     //  2^7 = 128 cases ~= about 10s runtime
@@ -2394,7 +3382,6 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       rsrWithdrawal,
       rsrReward,
       unstakingDelay,
-      rewardPeriod,
       rewardRatio,
     ]: BigNumber[]) => {
       // === Setup ===
@@ -2418,28 +3405,13 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // Do accretion
       if (rsrAccreted.gt(0)) {
         await rsr.connect(owner).mint(stRSR.address, rsrAccreted)
-        await stRSR.connect(owner).setRewardRatio(fp('1'))
-        await advanceTime(
-          bn(await stRSR.rewardPeriod())
-            .add(1)
-            .toString()
-        )
-        await expect(stRSR.payoutRewards())
-          .to.emit(stRSR, 'ExchangeRateSet')
-          .withArgs(fp('1'), fp('1'))
-        // first payout only registers the mint
-
-        await advanceTime(
-          bn(await stRSR.rewardPeriod())
-            .add(1)
-            .toString()
-        )
+        await stRSR.connect(owner).setRewardRatio(bn('1e14')) // this pays out rewards
+        await setNextBlockTimestamp(Number(ONE_PERIOD.add(await getLatestBlockTimestamp())))
         await expect(stRSR.payoutRewards())
         // now the mint has been fully paid out
       }
 
       // Config -- note this assumes the gov params have been chosen sensibly
-      await stRSR.connect(owner).setRewardPeriod(rewardPeriod)
       await stRSR.connect(owner).setUnstakingDelay(unstakingDelay)
       await stRSR.connect(owner).setRewardRatio(rewardRatio)
 
@@ -2455,11 +3427,14 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       // === Simulate ===
 
       // To register the reward amount
-      await advanceTime(rewardPeriod.add(1).toString())
+
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
       await expect(stRSR.payoutRewards()).to.emit(stRSR, 'ExchangeRateSet')
 
       // Payout over 1000 periods
-      await advanceTime(rewardPeriod.mul(1000).add(1).toString())
+      await setNextBlockTimestamp(
+        Number(await getLatestBlockTimestamp()) + 1000 * Number(ONE_PERIOD)
+      )
       await stRSR.payoutRewards()
 
       if (rsrStake.gt(0)) {
@@ -2467,7 +3442,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
         await stRSR.connect(addr1).unstake(await stRSR.balanceOf(addr1.address))
       }
 
-      await advanceTime(unstakingDelay.add(1).toString())
+      await advanceToTimestamp(Number(unstakingDelay.add(await getLatestBlockTimestamp())))
 
       // Clear both withdrawals
       if (rsrStake.gt(0)) {
@@ -2494,10 +3469,7 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     // max: 1 year
     const unstakingDelays = [bn(MAX_UNSTAKING_DELAY), bn('0'), bn('604800')]
 
-    // max: 1 year
-    const rewardPeriods = [bn(MAX_PERIOD), bn('1'), bn('604800')]
-
-    const rewardRatios = [fp('1'), fp('0'), fp('0.02284')]
+    const rewardRatios = [bn('1e14'), fp('0'), fp('0.000001069671574938')]
 
     let dimensions = [
       rsrStakes,
@@ -2505,7 +3477,6 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
       rsrWithdrawals,
       rsrRewards,
       unstakingDelays,
-      rewardPeriods,
       rewardRatios,
     ]
 
@@ -2519,8 +3490,8 @@ describe(`StRSRP${IMPLEMENTATION} contract`, () => {
     const numCases = cases.length.toString()
 
     cases.forEach((params, index) => {
-      // if (rewardPeriod * 2 > unstakingDelay)
-      if (params[5].mul(2).lte(params[4])) {
+      // if (2 periods <= unstakingDelay)
+      if (ONE_PERIOD.mul(2).lte(params[4])) {
         it(`case ${index + 1} of ${numCases}: ${params.map(shortString).join(' ')}`, async () => {
           await runSimulation(params)
         })

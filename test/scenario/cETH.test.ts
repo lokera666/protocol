@@ -1,31 +1,41 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { BigNumber, Wallet } from 'ethers'
-import { ethers, waffle } from 'hardhat'
+import { BigNumber } from 'ethers'
+import { ethers } from 'hardhat'
 import { bn, fp } from '../../common/numbers'
 import { IConfig } from '../../common/configuration'
-import { CollateralStatus, ZERO_ADDRESS } from '../../common/constants'
+import { CollateralStatus, TradeKind } from '../../common/constants'
 import {
   CTokenMock,
   CTokenSelfReferentialCollateral,
   ComptrollerMock,
   ERC20Mock,
   IAssetRegistry,
-  IBasketHandler,
+  IFacadeTest,
   MockV3Aggregator,
-  OracleLib,
   SelfReferentialCollateral,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIStRSR,
   TestIRevenueTrader,
   TestIRToken,
   WETH9,
 } from '../../typechain'
+import { advanceTime } from '../utils/time'
 import { getTrade } from '../utils/trades'
 import { setOraclePrice } from '../utils/oracles'
-import { Collateral, defaultFixture, IMPLEMENTATION, ORACLE_TIMEOUT } from '../fixtures'
+import {
+  Collateral,
+  defaultFixtureNoBasket,
+  IMPLEMENTATION,
+  ORACLE_ERROR,
+  ORACLE_TIMEOUT,
+  PRICE_TIMEOUT,
+  REVENUE_HIDING,
+} from '../fixtures'
 
-const createFixtureLoader = waffle.createFixtureLoader
+const DELAY_UNTIL_DEFAULT = bn('86400') // 24h
 
 describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`, () => {
   let owner: SignerWithAddress
@@ -37,7 +47,6 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
 
   // Non-backing assets
   let compoundMock: ComptrollerMock
-  let compToken: ERC20Mock
 
   // Tokens and Assets
   let weth: WETH9
@@ -58,20 +67,12 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
   let rToken: TestIRToken
   let assetRegistry: IAssetRegistry
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
+  let basketHandler: TestIBasketHandler
   let rsrTrader: TestIRevenueTrader
   let rTokenTrader: TestIRevenueTrader
-  let oracleLib: OracleLib
-
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
+  let facadeTest: IFacadeTest
 
   let initialBal: BigNumber
-
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
 
   beforeEach(async () => {
     ;[owner, addr1, addr2] = await ethers.getSigners()
@@ -82,7 +83,6 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       rsr,
       stRSR,
       compoundMock,
-      compToken,
       erc20s,
       collateral,
       config,
@@ -92,8 +92,8 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       basketHandler,
       rsrTrader,
       rTokenTrader,
-      oracleLib,
-    } = await loadFixture(defaultFixture))
+      facadeTest,
+    } = await loadFixture(defaultFixtureNoBasket))
 
     // Main ERC20
     token0 = <CTokenMock>erc20s[4] // cDai
@@ -105,36 +105,40 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       await (await ethers.getContractFactory('MockV3Aggregator')).deploy(8, bn('1e8'))
     )
     wethCollateral = await (
-      await ethers.getContractFactory('SelfReferentialCollateral', {
-        libraries: { OracleLib: oracleLib.address },
-      })
-    ).deploy(
-      chainlinkFeed.address,
-      weth.address,
-      ZERO_ADDRESS,
-      config.rTokenTradingRange,
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('ETH')
-    )
+      await ethers.getContractFactory('SelfReferentialCollateral')
+    ).deploy({
+      priceTimeout: PRICE_TIMEOUT,
+      chainlinkFeed: chainlinkFeed.address,
+      oracleError: ORACLE_ERROR,
+      erc20: weth.address,
+      maxTradeVolume: config.rTokenMaxTradeVolume,
+      oracleTimeout: ORACLE_TIMEOUT,
+      targetName: ethers.utils.formatBytes32String('ETH'),
+      defaultThreshold: bn(0),
+      delayUntilDefault: DELAY_UNTIL_DEFAULT,
+    })
 
     // cETH
     cETH = await (
       await ethers.getContractFactory('CTokenMock')
-    ).deploy('cETH Token', 'cETH', weth.address)
+    ).deploy('cETH Token', 'cETH', weth.address, compoundMock.address)
 
     cETHCollateral = await (
-      await ethers.getContractFactory('CTokenSelfReferentialCollateral', {
-        libraries: { OracleLib: oracleLib.address },
-      })
+      await ethers.getContractFactory('CTokenSelfReferentialCollateral')
     ).deploy(
-      chainlinkFeed.address,
-      cETH.address,
-      compToken.address,
-      config.rTokenTradingRange,
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('ETH'),
-      await weth.decimals(),
-      compoundMock.address
+      {
+        priceTimeout: PRICE_TIMEOUT,
+        chainlinkFeed: chainlinkFeed.address,
+        oracleError: ORACLE_ERROR,
+        erc20: cETH.address,
+        maxTradeVolume: config.rTokenMaxTradeVolume,
+        oracleTimeout: ORACLE_TIMEOUT,
+        targetName: ethers.utils.formatBytes32String('ETH'),
+        defaultThreshold: bn(0),
+        delayUntilDefault: DELAY_UNTIL_DEFAULT,
+      },
+      REVENUE_HIDING,
+      await weth.decimals()
     )
 
     // Backup
@@ -156,6 +160,7 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       weth.address,
     ])
     await basketHandler.refreshBasket()
+    await advanceTime(config.warmupPeriod.toNumber() + 1)
 
     await backingManager.grantRTokenAllowance(token0.address)
     await backingManager.grantRTokenAllowance(cETH.address)
@@ -196,22 +201,32 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
 
     it('should sell appreciating stable collateral and ignore cETH', async () => {
       await token0.setExchangeRate(fp('1.1')) // 10% appreciation
-      await expect(backingManager.manageTokens([token0.address])).to.not.emit(
-        backingManager,
-        'TradeStarted'
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.revertedWith(
+        'already collateralized'
       )
+      await backingManager.forwardRevenue([token0.address, cETH.address])
       expect(await cETH.balanceOf(rTokenTrader.address)).to.equal(0)
       expect(await cETH.balanceOf(rsrTrader.address)).to.equal(0)
-      await expect(rTokenTrader.manageToken(cETH.address)).to.not.emit(rTokenTrader, 'TradeStarted')
-      await expect(rTokenTrader.manageToken(token0.address)).to.emit(rTokenTrader, 'TradeStarted')
+      await expect(
+        rTokenTrader.manageTokens([cETH.address], [TradeKind.BATCH_AUCTION])
+      ).to.be.revertedWith('0 balance')
+      await expect(rTokenTrader.manageTokens([token0.address], [TradeKind.BATCH_AUCTION])).to.emit(
+        rTokenTrader,
+        'TradeStarted'
+      )
 
       // RTokenTrader should be selling token0 and buying RToken
       const trade = await getTrade(rTokenTrader, token0.address)
       expect(await trade.sell()).to.equal(token0.address)
       expect(await trade.buy()).to.equal(rToken.address)
 
-      await expect(rsrTrader.manageToken(cETH.address)).to.not.emit(rsrTrader, 'TradeStarted')
-      await expect(rsrTrader.manageToken(token0.address)).to.emit(rsrTrader, 'TradeStarted')
+      await expect(
+        rsrTrader.manageTokens([cETH.address], [TradeKind.BATCH_AUCTION])
+      ).to.be.revertedWith('0 balance')
+      await expect(rsrTrader.manageTokens([token0.address], [TradeKind.BATCH_AUCTION])).to.emit(
+        rsrTrader,
+        'TradeStarted'
+      )
 
       // RSRTrader should be selling token0 and buying RToken
       const trade2 = await getTrade(rsrTrader, token0.address)
@@ -222,7 +237,11 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
     it('should change basket around cETH', async () => {
       await token0.setExchangeRate(fp('0.99')) // default
       await basketHandler.refreshBasket()
-      await expect(backingManager.manageTokens([token0.address, cETH.address])).to.emit(
+
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.emit(
         backingManager,
         'TradeStarted'
       )
@@ -260,13 +279,17 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
     it('should sell cETH for RToken after redemption rate increase', async () => {
       await cETH.setExchangeRate(fp('2')) // doubling of price
       await basketHandler.refreshBasket()
-      await expect(backingManager.manageTokens([cETH.address])).to.not.emit(
-        backingManager,
-        'TradeStarted'
+      await advanceTime(config.warmupPeriod.toNumber() + 1)
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.revertedWith(
+        'already collateralized'
       )
+      await backingManager.forwardRevenue([cETH.address])
 
       // RTokenTrader should be selling cETH and buying RToken
-      await expect(rTokenTrader.manageToken(cETH.address)).to.emit(rTokenTrader, 'TradeStarted')
+      await expect(rTokenTrader.manageTokens([cETH.address], [TradeKind.BATCH_AUCTION])).to.emit(
+        rTokenTrader,
+        'TradeStarted'
+      )
       const trade = await getTrade(rTokenTrader, cETH.address)
       expect(await trade.sell()).to.equal(cETH.address)
       expect(await trade.buy()).to.equal(rToken.address)
@@ -276,17 +299,19 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       await setOraclePrice(wethCollateral.address, bn('0.5e8')) // doubling of price
       await assetRegistry.refresh()
 
-      // Should be fully capitalized
+      // Should be fully collateralized
       expect(await basketHandler.fullyCollateralized()).to.equal(true)
       expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
-      expect(await basketHandler.basketsHeldBy(backingManager.address)).to.equal(issueAmt)
+      expect(await facadeTest.wholeBasketsHeldBy(rToken.address, backingManager.address)).to.equal(
+        issueAmt
+      )
     })
 
     it('should be able to deregister', async () => {
       await assetRegistry.connect(owner).unregister(cETHCollateral.address)
       await basketHandler.refreshBasket()
 
-      // Should be in an undercapitalized state but SOUND
+      // Should be in an undercollateralized state but SOUND
       expect(await basketHandler.fullyCollateralized()).to.equal(false)
       expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
     })
@@ -296,18 +321,26 @@ describe(`CToken of self-referential collateral (eg cETH) - P${IMPLEMENTATION}`,
       await cETH.setExchangeRate(fp('0.99'))
       await basketHandler.refreshBasket()
 
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
       // Should swap WETH in for cETH
       const [tokens] = await basketHandler.quote(fp('1'), 2)
       expect(tokens[0]).to.equal(token0.address)
       expect(tokens[1]).to.equal(weth.address)
 
-      // Should not be fully capitalized
+      // Should not be fully collateralized
       expect(await basketHandler.fullyCollateralized()).to.equal(false)
       expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
-      expect(await basketHandler.basketsHeldBy(backingManager.address)).to.equal(0)
+      expect(await facadeTest.wholeBasketsHeldBy(rToken.address, backingManager.address)).to.equal(
+        0
+      )
 
       // Should view WETH as surplus
-      await expect(backingManager.manageTokens([])).to.emit(backingManager, 'TradeStarted')
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.emit(
+        backingManager,
+        'TradeStarted'
+      )
 
       // BackingManager should be selling cETH and buying WETH
       const trade = await getTrade(backingManager, cETH.address)

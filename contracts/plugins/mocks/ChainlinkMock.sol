@@ -21,13 +21,24 @@ contract MockV3Aggregator is AggregatorV3Interface {
     uint256 public latestTimestamp;
     uint256 public latestRound;
 
+    // Additional variable to be able to test invalid behavior
+    uint256 public latestAnsweredRound;
+    address public aggregator;
+    address public priceSource;
+
     mapping(uint256 => int256) public getAnswer;
     mapping(uint256 => uint256) public getTimestamp;
     mapping(uint256 => uint256) private getStartedAt;
 
     constructor(uint8 _decimals, int256 _initialAnswer) {
         decimals = _decimals;
+        aggregator = address(this);
+        priceSource = address(this);
         updateAnswer(_initialAnswer);
+    }
+
+    function deprecate() external {
+        aggregator = address(0);
     }
 
     function updateAnswer(int256 _answer) public {
@@ -37,11 +48,28 @@ contract MockV3Aggregator is AggregatorV3Interface {
         getAnswer[latestRound] = _answer;
         getTimestamp[latestRound] = block.timestamp;
         getStartedAt[latestRound] = block.timestamp;
+        latestAnsweredRound = latestRound;
+    }
+
+    // used by Frax oracle
+    function addRoundData(bool isBadData, uint104 low, uint104 high, uint40 timestamp) public {
+        latestAnswer = int104(low + high) / 2;
+        latestTimestamp = block.timestamp;
+        latestRound++;
+        getAnswer[latestRound] = latestAnswer;
+        getTimestamp[latestRound] = block.timestamp;
+        getStartedAt[latestRound] = block.timestamp;
+        latestAnsweredRound = latestRound;
     }
 
     // Additional function to be able to test invalid Chainlink behavior
     function setInvalidTimestamp() public {
         getTimestamp[latestRound] = 0;
+    }
+
+    // Additional function to be able to test invalid Chainlink behavior
+    function setInvalidAnsweredRound() public {
+        latestAnsweredRound = 0;
     }
 
     function updateRoundData(
@@ -56,6 +84,7 @@ contract MockV3Aggregator is AggregatorV3Interface {
         getAnswer[latestRound] = _answer;
         getTimestamp[latestRound] = _timestamp;
         getStartedAt[latestRound] = _startedAt;
+        latestAnsweredRound = _roundId;
     }
 
     function getRoundData(uint80 _roundId)
@@ -70,6 +99,12 @@ contract MockV3Aggregator is AggregatorV3Interface {
             uint80 answeredInRound
         )
     {
+        if (aggregator == address(0)) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(0, 0)
+            }
+        }
         return (
             _roundId,
             getAnswer[_roundId],
@@ -82,6 +117,7 @@ contract MockV3Aggregator is AggregatorV3Interface {
     function latestRoundData()
         external
         view
+        virtual
         override
         returns (
             uint80 roundId,
@@ -91,12 +127,18 @@ contract MockV3Aggregator is AggregatorV3Interface {
             uint80 answeredInRound
         )
     {
+        if (aggregator == address(0)) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(0, 0)
+            }
+        }
         return (
             uint80(latestRound),
             getAnswer[latestRound],
             getStartedAt[latestRound],
             getTimestamp[latestRound],
-            uint80(latestRound)
+            uint80(latestAnsweredRound)
         );
     }
 

@@ -1,49 +1,43 @@
 import { getChainId } from '../../../common/blockchain-utils'
 import { task } from 'hardhat/config'
 import { ContractFactory } from 'ethers'
-import { Collateral } from '../../../typechain'
+import { NonFiatCollateral } from '../../../typechain'
 
 task('deploy-nonfiat-collateral', 'Deploys a non-fiat Collateral')
+  .addParam('priceTimeout', 'The amount of time before a price decays to 0')
   .addParam('referenceUnitFeed', 'Reference Price Feed address')
   .addParam('targetUnitFeed', 'Target Unit Price Feed address')
+  .addParam('combinedOracleError', 'The combined % error from both oracle sources')
   .addParam('tokenAddress', 'ERC20 token address')
-  .addParam('rewardToken', 'Reward token address')
-  .addParam('tradingValMin', 'Trade Range - Min in UoA')
-  .addParam('tradingValMax', 'Trade Range - Max in UoA')
-  .addParam('tradingAmtMin', 'Trade Range - Min in whole toks')
-  .addParam('tradingAmtMax', 'Trade Range - Max in whole toks')
-  .addParam('oracleTimeout', 'Max oracle timeout')
+  .addParam('maxTradeVolume', 'Max Trade Volume (in UoA)')
+  .addParam('oracleTimeout', 'Max oracle timeout for the reference unit feed')
+  .addParam('targetUnitOracleTimeout', 'Max oracle timeout for the target unit feed')
   .addParam('targetName', 'Target Name')
   .addParam('defaultThreshold', 'Default Threshold')
   .addParam('delayUntilDefault', 'Delay until default')
-  .addParam('oracleLib', 'Oracle library address')
   .setAction(async (params, hre) => {
     const [deployer] = await hre.ethers.getSigners()
 
     const chainId = await getChainId(hre)
 
     const NonFiatCollateralFactory: ContractFactory = await hre.ethers.getContractFactory(
-      'NonFiatCollateral',
-      {
-        libraries: { OracleLib: params.oracleLib },
-      }
+      'NonFiatCollateral'
     )
 
-    const collateral = <Collateral>await NonFiatCollateralFactory.connect(deployer).deploy(
-      params.referenceUnitFeed,
-      params.targetUnitFeed,
-      params.tokenAddress,
-      params.rewardToken,
+    const collateral = <NonFiatCollateral>await NonFiatCollateralFactory.connect(deployer).deploy(
       {
-        minVal: params.tradingValMin,
-        maxVal: params.tradingValMax,
-        minAmt: params.tradingAmtMin,
-        maxAmt: params.tradingAmtMax,
+        priceTimeout: params.priceTimeout,
+        chainlinkFeed: params.referenceUnitFeed,
+        oracleError: params.combinedOracleError,
+        erc20: params.tokenAddress,
+        maxTradeVolume: params.maxTradeVolume,
+        oracleTimeout: params.oracleTimeout,
+        targetName: params.targetName,
+        defaultThreshold: params.defaultThreshold,
+        delayUntilDefault: params.delayUntilDefault,
       },
-      params.oracleTimeout,
-      params.targetName,
-      params.defaultThreshold,
-      params.delayUntilDefault
+      params.targetUnitFeed,
+      params.targetUnitOracleTimeout
     )
     await collateral.deployed()
 

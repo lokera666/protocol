@@ -1,7 +1,6 @@
 import { expect } from 'chai'
 import { ContractFactory, BigNumber } from 'ethers'
 import { ethers } from 'hardhat'
-import fc from 'fast-check'
 
 import { BN_SCALE_FACTOR } from '../../common/constants'
 import { bn, fp, pow10, fpCeil, fpFloor, fpRound, div, shortString } from '../../common/numbers'
@@ -32,7 +31,6 @@ describe('In FixLib,', () => {
   const MAX_UINT192 = BigNumber.from(2).pow(192).sub(1)
   const MIN_UINT192 = bn(0)
   const MAX_FIX_UINT = MAX_UINT192.div(pow10(18)) // biggest integer N st toFix(N) exists
-  const MIN_FIX_UINT = bn(0) // smallest integer N st toFix(N) exists
 
   // prettier-ignore
   const positive_int192s: BigNumber[] = [
@@ -61,9 +59,14 @@ describe('In FixLib,', () => {
     })
 
     it('fails on inputs outside its domain', async () => {
-      await expect(caller.toFix_(MAX_FIX_UINT.add(1))).to.be.revertedWith('UIntOutOfBounds')
-      await expect(caller.toFix_(MAX_FIX_UINT.mul(17))).to.be.revertedWith('UIntOutOfBounds')
-      await expect(caller.toFix_(MIN_FIX_UINT.sub(1))).to.be.reverted
+      await expect(caller.toFix_(MAX_FIX_UINT.add(1))).to.be.revertedWithCustomError(
+        caller,
+        'UIntOutOfBounds'
+      )
+      await expect(caller.toFix_(MAX_FIX_UINT.mul(17))).to.be.revertedWithCustomError(
+        caller,
+        'UIntOutOfBounds'
+      )
     })
   })
 
@@ -103,15 +106,11 @@ describe('In FixLib,', () => {
 
     it('fails on inputs outside its domain', async () => {
       const table = [
-        [MAX_FIX_UINT, 1],
-        [MAX_FIX_UINT.add(1), 0],
-        [MIN_FIX_UINT.sub(1), 0],
-        [1, 58],
-        [-1, 58],
-        [bn('1e8'), 50],
-        [bn('-1e8'), 50],
-        [bn('5e56'), 2],
-        [bn('-5e56'), 2],
+        [MAX_FIX_UINT, bn(1)],
+        [MAX_FIX_UINT.add(1), bn(0)],
+        [bn(1), bn(58)],
+        [bn('1e8'), bn(50)],
+        [bn('5e56'), bn(2)],
       ]
 
       for (const [x, s] of table) {
@@ -280,15 +279,8 @@ describe('In FixLib,', () => {
         expect(await caller.toUintRnd(fp(input), CEIL), `fp(${input})`).to.equal(ceil)
       }
     })
-    it('fails on negative Fixes', async () => {
-      const table = [-1, MAX_FIX_UINT.mul(-1), fp(-986349)]
-      for (const val of table) {
-        await expect(caller.toUint(val), `${val}`).to.be.reverted
-        await expect(caller.toUintRnd(val, FLOOR), `${val}`).to.be.reverted
-        await expect(caller.toUintRnd(val, ROUND), `${val}`).to.be.reverted
-        await expect(caller.toUintRnd(val, CEIL), `${val}`).to.be.reverted
-      }
-    })
+    // This is true by definition for a function that takes a uint
+    // it('fails on negative Fixes', async () => {})
   })
 
   describe('shiftl(Fix, int8)', () => {
@@ -374,11 +366,6 @@ describe('In FixLib,', () => {
       await expect(caller.plus(MAX_UINT192, 1), 'plus(MAX, 1)').to.be.reverted
       const half_max = MAX_UINT192.add(1).div(2)
       await expect(caller.plus(half_max, half_max), 'plus((MAX+1)/2, (MAX+1)/2)').to.be.reverted
-      await expect(caller.plus(MIN_UINT192, -1), 'plus(MIN, -1)').to.be.reverted
-      await expect(
-        caller.plus(MIN_UINT192.div(2), MIN_UINT192.div(2).sub(1)),
-        'plus(MIN/2, MIN/2 -1)'
-      ).to.be.reverted
     })
   })
 
@@ -455,14 +442,10 @@ describe('In FixLib,', () => {
       expect(await caller.minus(MIN_UINT192, MIN_UINT192)).to.equal(0)
     })
     it('fails outside its range', async () => {
-      await expect(caller.minus(MAX_UINT192, -1), 'minus(MAX, -1)').to.be.reverted
       const half_max = MAX_UINT192.add(1).div(2)
-      await expect(caller.minus(half_max, half_max.mul(-1)), 'minus((MAX+1)/2, -(MAX+1)/2)').to.be
+      await expect(caller.minus(half_max, half_max.add(1)), 'minus((MAX+1)/2, -(MAX+1)/2)').to.be
         .reverted
       await expect(caller.minus(MIN_UINT192, 1), 'minus(MIN, 1)').to.be.reverted
-      const half_min = MIN_UINT192.div(2)
-      await expect(caller.minus(half_min, half_min.sub(1).mul(-1)), 'minus(MIN/2, -MIN/2 +1)').to.be
-        .reverted
     })
   })
 
@@ -512,7 +495,7 @@ describe('In FixLib,', () => {
     [1.001, 999, 999.999],
     [12, 13, 156],
   ]
-  describe('mul + mulRnd', () => {
+  describe('mul + mulRnd + safeMul', () => {
     it('correctly multiplies inside its range', async () => {
       const commutes = mulu_table.flatMap(([a, b, c]) => [
         [a, b, c],
@@ -521,12 +504,16 @@ describe('In FixLib,', () => {
       const table = commutes.flatMap(([a, b, c]) => [[a, b, c]])
       for (const [a, b, c] of table) {
         expect(await caller.mul(fp(a), fp(b)), `mul(fp(${a}), fp(${b}))`).to.equal(fp(c))
+        expect(await caller.safeMul(fp(a), fp(b), ROUND), `safeMul(fp(${a}), fp(${b}))`).to.equal(
+          fp(c)
+        )
       }
     })
 
     function mulTest(x: string, y: string, result: string) {
       it(`mul(${x}, ${y}) == ${result}`, async () => {
         expect(await caller.mul(fp(x), fp(y))).to.equal(fp(result))
+        expect(await caller.safeMul(fp(x), fp(y), ROUND)).to.equal(fp(result))
       })
     }
 
@@ -544,8 +531,11 @@ describe('In FixLib,', () => {
       for (const [a, b, c] of table) {
         expect(await caller.mul(a, b), `mul(${a}, ${b})`).to.equal(c)
         expect(await caller.mul(b, a), `mul(${b}, ${a})`).to.equal(c)
+        expect(await caller.safeMul(a, b, ROUND), `safeMul(${b}, ${a})`).to.equal(c)
+        expect(await caller.safeMul(b, a, ROUND), `safeMul(${b}, ${a})`).to.equal(c)
       }
     })
+
     it('correctly rounds', async () => {
       const table = mulu_table.flatMap(([a, b]) => [[fp(a), fp(b)]])
 
@@ -557,15 +547,23 @@ describe('In FixLib,', () => {
         expect(await caller.mulRnd(a, b, FLOOR), `mulRnd((${a}, ${b}, FLOOR)`).to.equal(floor)
         expect(await caller.mulRnd(a, b, ROUND), `mulRnd((${a}, ${b}, ROUND)`).to.equal(round)
         expect(await caller.mulRnd(a, b, CEIL), `mulRnd((${a}, ${b}, CEIL)`).to.equal(ceil)
+        expect(await caller.safeMul(a, b, FLOOR), `safeMul((${a}, ${b}, FLOOR)`).to.equal(floor)
+        expect(await caller.safeMul(a, b, ROUND), `safeMul((${a}, ${b}, ROUND)`).to.equal(round)
+        expect(await caller.safeMul(a, b, CEIL), `safeMul((${a}, ${b}, CEIL)`).to.equal(ceil)
       }
     })
     it('fails outside its range', async () => {
-      await expect(caller.mul(MIN_UINT192, fp(-1)), 'mul(MIN, -1)').to.be.reverted
       await expect(caller.mul(MAX_UINT192.div(2).add(1), fp(2)), 'mul(MAX/2 + 2, 2)').to.be.reverted
       await expect(caller.mul(fp(bn(2).pow(81)), fp(bn(2).pow(81))), 'mul(2^81, 2^81)').to.be
         .reverted
-      await expect(caller.mul(fp(bn(2).pow(81).mul(-1)), fp(bn(2).pow(81))), 'mul(-2^81, 2^81)').to
-        .be.reverted
+
+      // SafeMul should not fail
+      await expect(caller.safeMul(MAX_UINT192.div(2).add(1), fp(2), ROUND), 'safeMul(MAX/2 + 2, 2)')
+        .to.not.be.reverted
+      await expect(
+        caller.safeMul(fp(bn(2).pow(81)), fp(bn(2).pow(81)), ROUND),
+        'safeMul(2^81, 2^81)'
+      ).to.not.be.reverted
     })
   })
 
@@ -600,7 +598,7 @@ describe('In FixLib,', () => {
       }
     })
   })
-  describe('div + divRnd', () => {
+  describe('div + divRnd + safeDiv', () => {
     it('correctly divides inside its range', async () => {
       // prettier-ignore
       const table: BigNumber[][] = [
@@ -615,6 +613,7 @@ describe('In FixLib,', () => {
 
       for (const [a, b, c] of table) {
         expect(await caller.div(a, b), `div(${a}, ${b})`).to.equal(c)
+        expect(await caller.safeDiv_(a, b, FLOOR), `safeDiv_(${a}, ${b}, FLOOR)`).to.equal(c)
       }
     })
     it('correctly divides at the extremes of its range', async () => {
@@ -627,6 +626,7 @@ describe('In FixLib,', () => {
 
       for (const [a, b, c] of table) {
         expect(await caller.div(a, b), `div((${a}, ${b})`).to.equal(c)
+        expect(await caller.safeDiv_(a, b, FLOOR), `safeDiv_((${a}, ${b}, FLOOR)`).to.equal(c)
       }
     })
     it('correctly rounds', async () => {
@@ -644,6 +644,9 @@ describe('In FixLib,', () => {
         expect(await caller.divRnd(a, b, FLOOR), `div((${a}, ${b}, FLOOR)`).to.equal(floor)
         expect(await caller.divRnd(a, b, ROUND), `div((${a}, ${b}, ROUND)`).to.equal(round)
         expect(await caller.divRnd(a, b, CEIL), `div((${a}, ${b}, CEIL)`).to.equal(ceil)
+        expect(await caller.safeDiv_(a, b, FLOOR), `safeDiv_((${a}, ${b}, FLOOR)`).to.equal(floor)
+        expect(await caller.safeDiv_(a, b, ROUND), `safeDiv_((${a}, ${b}, ROUND)`).to.equal(round)
+        expect(await caller.safeDiv_(a, b, CEIL), `safeDiv_((${a}, ${b}, CEIL)`).to.equal(ceil)
       }
     })
     it('fails outside its range', async () => {
@@ -652,19 +655,29 @@ describe('In FixLib,', () => {
         [MAX_UINT192, fp(0.99)],
         [MAX_UINT192.div(5), fp(0.19)],
         [MAX_UINT192.div(pow10(16)), bn(1)],
-      ].flatMap(([a, b]) => [[a, b], [a, neg(b)]])
+      ]
 
       for (const [a, b] of table) {
         await expect(caller.div(a, b), `div((${a}, ${b})`).to.be.reverted
+        await expect(caller.safeDiv_(a, b, FLOOR), `safeDiv_((${a}, ${b}, FLOOR)`).not.to.be
+          .reverted
+        await expect(caller.safeDiv_(a, b, ROUND), `safeDiv_((${a}, ${b}, ROUND)`).not.to.be
+          .reverted
+        await expect(caller.safeDiv_(a, b, CEIL), `safeDiv_((${a}, ${b}, CEIL)`).not.to.be.reverted
       }
     })
     it('fails to divide by zero', async () => {
       // prettier-ignore
       const table =
-        [fp(1), fp(MAX_UINT192), fp(MIN_UINT192), fp(0), bn(1), bn(987162349587)]
+        [fp(1), MAX_UINT192, MIN_UINT192, fp(0), bn(1), bn(987162349587)]
 
       for (const x of table) {
         await expect(caller.div(x, bn(0)), `div(${x}, 0`).to.be.reverted
+        await expect(caller.safeDiv_(x, bn(0), FLOOR), `safeDiv_(${x}, 0, FLOOR)`).to.not.be
+          .reverted
+        await expect(caller.safeDiv_(x, bn(0), ROUND), `safeDiv_(${x}, 0, ROUND)`).to.not.be
+          .reverted
+        await expect(caller.safeDiv_(x, bn(0), CEIL), `safeDiv_(${x}, 0, CEIL)`).to.not.be.reverted
       }
     })
   })
@@ -716,8 +729,8 @@ describe('In FixLib,', () => {
     })
     it('fails to divide by zero', async () => {
       // prettier-ignore
-      const table = [fp(1), fp(0), fp(-1), bn(1), bn(-1),
-                     bn(987162349587), fp(MAX_UINT192), fp(MIN_UINT192),]
+      const table = [fp(1), fp(0), bn(1), 
+                     bn(987162349587), MAX_UINT192, MIN_UINT192,]
 
       for (const x of table) {
         await expect(caller.divu(x, bn(0)), `divu(${x}, 0`).to.be.reverted
@@ -725,22 +738,15 @@ describe('In FixLib,', () => {
     })
   })
   describe('powu', () => {
-    it('correctly exponentiates inside its range', () => {
+    context('correctly exponentiates inside its range', () => {
       // prettier-ignore
       const table = [
-        [fp(1.0), bn(1), fp(1.0)],
-        [fp(1.0), bn(15), fp(1.0)],
-        [fp(2), bn(7), fp(128)],
-        [fp(2), bn(63), fp('9223372036854775808')],
-        [fp(2), bn(64), fp('18446744073709551616')],
-        [fp(1.5), bn(7), fp(17.0859375)],
-        [fp(1.1), bn(4), fp('1.4641')],
-        [fp(1.1), bn(5), fp('1.61051')],
-        [fp(0.23), bn(3), fp('0.012167')],
-        [bn(1), bn(2), bn(0)],
-        [fp('1e-9'), bn(2), fp('1e-18')],
-        [fp(0.1), bn(17), fp('1e-17')],
-        [fp(10), bn(19), fp('1e19')]
+        [fp('1'), bn('1'), fp('1')],
+        [fp('1'), bn('15'), fp('1')],
+        [fp('0.23'), bn('3'), fp('0.012167')],
+        [bn('1'), bn('2'), bn('0')],
+        [fp('1e-9'), bn('2'), fp('1e-18')],
+        [fp('0.1'), bn('17'), fp('1e-17')],
       ]
 
       for (const [a, b, c] of table) {
@@ -750,34 +756,11 @@ describe('In FixLib,', () => {
       }
     })
 
-    it('correctly exponentiates at the extremes of its range', () => {
+    context('fails outside its range', () => {
       const table = [
-        [MAX_UINT192, bn(1), MAX_UINT192],
-        [MIN_UINT192, bn(1), MIN_UINT192],
-        [MIN_UINT192, bn(0), fp(1)],
-        [fp(0), bn(0), fp(1.0)],
-        [fp(987.0), bn(0), fp(1.0)],
-        [fp(1.0), bn(2).pow(32).sub(1), fp(1.0)],
-        [fp(2), bn(131), fp(bn(2).pow(131))],
-      ]
-
-      for (const [a, b, c] of table) {
-        it(`powu(${shortString(a)}, ${shortString(b)}) == ${shortString(c)}`, async () => {
-          expect(await caller.powu(a, b)).to.equal(c)
-        })
-      }
-    })
-    it('fails outside its range', () => {
-      const table = [
-        [fp(10), bn(40)],
-        [fp(-10), bn(40)],
+        [fp('1.0001'), bn(1)],
+        [fp('2'), bn(1)],
         [MAX_UINT192, bn(2)],
-        [MIN_UINT192.sub(1), bn(2)],
-        [fp('8e19'), bn(2)],
-        [fp('1.9e13'), bn(3)],
-        [fp('9e9'), bn(4)],
-        [fp('9.2e8'), bn(5)],
-        [fp(2), bn(191)],
       ]
 
       for (const [a, b] of table) {
@@ -785,6 +768,48 @@ describe('In FixLib,', () => {
           await expect(caller.powu(a, b)).to.be.reverted
         })
       }
+    })
+  })
+
+  describe('sqrt', () => {
+    context('correctly sqrts inside its range', () => {
+      // prettier-ignore
+      const table = [
+        [fp('1'), fp('1')],
+        [fp('4'), fp('2')],
+        [fp('144'), fp('12')],
+        [fp('38416'), fp('196')],
+        [fp('1.21'), fp('1.1')],
+      ]
+
+      for (const [a, b] of table) {
+        it(`sqrt(${shortString(a)}) == ${shortString(b)}`, async () => {
+          expect(await caller.sqrt(a)).to.equal(b)
+        })
+      }
+    })
+
+    context('correctly sqrts at the extremes of its range', () => {
+      const table = [
+        [
+          MAX_UINT192,
+          bn(2)
+            .pow(96)
+            .mul(10 ** 9)
+            .sub(1),
+        ],
+        [0, 0],
+        [fp('1e-18'), fp('1e-9')],
+      ]
+
+      for (const [a, b] of table) {
+        it(`sqrt(${shortString(a)}) == ${shortString(b)}`, async () => {
+          expect(await caller.sqrt(a)).to.equal(b)
+        })
+      }
+    })
+    context('fails outside its range', () => {
+      // nothing is outside its range
     })
   })
 
@@ -965,66 +990,12 @@ describe('In FixLib,', () => {
     })
   })
 
-  // If seed is an arbitrary (possibly large) uint, return an aribtrary uint in [min, max)
-  // some quick bigint utitlity functions
-  const abs = (n: bigint) => (n >= 0n ? n : -n)
-  const ceilDiv = (x: bigint, y: bigint) => (x >= 0 ? (x + abs(y) - 1n) / y : (x - abs(y) + 1n) / y)
-  const roundDiv = (x: bigint, y: bigint) =>
-    x >= 0 ? (x + abs(y) / 2n) / y : (x - abs(y) / 2n) / y
-  const WORD = 2n ** 256n
-  const UINTMIN = 0n
-  const UINTMAX = 2n ** 192n - 1n
-
   describe('muluDivu + muluDivuRnd', () => {
     it('muluDivu(0,0,1,*) = 0)', async () => {
       expect(await caller.muluDivuRnd(bn(0), bn(0), bn(1), FLOOR)).to.equal(bn(0))
       expect(await caller.muluDivuRnd(bn(0), bn(0), bn(1), CEIL)).to.equal(bn(0))
       expect(await caller.muluDivuRnd(bn(0), bn(0), bn(1), ROUND)).to.equal(bn(0))
       expect(await caller.muluDivu(bn(0), bn(0), bn(1))).to.equal(bn(0))
-    })
-
-    it('muluDivu(,,FLOOR) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = (x * y) / z
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.muluDivu(bn(x), bn(y), bn(z))).to.equal(bn(expected))
-            expect(await caller.muluDivuRnd(bn(x), bn(y), bn(z), FLOOR)).to.equal(bn(expected))
-          } else {
-            await expect(caller.muluDivu(bn(x), bn(y), bn(z))).to.be.reverted
-            await expect(caller.muluDivuRnd(bn(x), bn(y), bn(z), FLOOR)).to.be.reverted
-          }
-        })
-      )
-    })
-
-    it('muluDivu(,,CEIL) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = ceilDiv(x * y, z)
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.muluDivuRnd(bn(x), bn(y), bn(z), CEIL)).to.equal(bn(expected))
-          } else {
-            await expect(caller.muluDivuRnd(bn(x), bn(y), bn(z), CEIL)).to.be.reverted
-          }
-        })
-      )
-    })
-
-    it('muluDivu(,,ROUND) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = roundDiv(x * y, z)
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.muluDivuRnd(bn(x), bn(y), bn(z), ROUND)).to.equal(bn(expected))
-          } else {
-            await expect(caller.muluDivuRnd(bn(x), bn(y), bn(z), ROUND)).to.be.reverted
-          }
-        })
-      )
     })
   })
 
@@ -1040,47 +1011,161 @@ describe('In FixLib,', () => {
       expect(await caller.mulDivRnd(bn(0), bn(0), bn(1), ROUND)).to.equal(bn(0))
       expect(await caller.mulDiv(bn(0), bn(0), bn(1))).to.equal(bn(0))
     })
+  })
 
-    it('mulDiv(,,FLOOR) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(192), fc.bigUintN(192), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = (x * y) / z
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.mulDiv(bn(x), bn(y), bn(z))).to.equal(bn(expected))
-            expect(await caller.mulDivRnd(bn(x), bn(y), bn(z), FLOOR)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDiv(bn(x), bn(y), bn(z))).to.be.reverted
-            await expect(caller.mulDivRnd(bn(x), bn(y), bn(z), FLOOR)).to.be.reverted
-          }
-        })
+  describe('safeMul', () => {
+    it('rounds up to FIX_MAX', async () => {
+      expect(await caller.safeMul(MAX_UINT192.div(2).add(1), fp(2), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMul(MAX_UINT192.div(2).add(1), fp(2), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMul(MAX_UINT192.div(2).add(1), fp(2), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMul(MAX_UINT192.sub(1), MAX_UINT192.sub(1), CEIL)).to.equal(
+        MAX_UINT192
       )
     })
-    it('mulDiv(,,CEIL) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(192), fc.bigUintN(192), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = ceilDiv(x * y, z)
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.mulDivRnd(bn(x), bn(y), bn(z), CEIL)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDivRnd(bn(x), bn(y), bn(z), CEIL)).to.be.reverted
-          }
-        })
+  })
+
+  describe('safeDiv', () => {
+    it('rounds up to FIX_MAX', async () => {
+      expect(await caller.safeDiv(MAX_UINT192, fp(1).sub(1), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv(MAX_UINT192, fp(1).sub(1), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv(MAX_UINT192, fp(1).sub(1), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeDiv(MAX_UINT192, 0, FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv(MAX_UINT192, 0, ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv(MAX_UINT192, 0, CEIL)).to.equal(MAX_UINT192)
+    })
+
+    it('rounds down to 0', async () => {
+      expect(await caller.safeDiv(0, 0, FLOOR)).to.equal(0)
+      expect(await caller.safeDiv(0, 0, ROUND)).to.equal(0)
+      expect(await caller.safeDiv(0, 0, CEIL)).to.equal(0)
+
+      expect(await caller.safeDiv(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, FLOOR)).to.equal(0)
+      expect(await caller.safeDiv(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, ROUND)).to.equal(1)
+      expect(await caller.safeDiv(MAX_UINT192.div(fp(2)).sub(1), MAX_UINT192, ROUND)).to.equal(0)
+      expect(await caller.safeDiv(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, CEIL)).to.equal(1)
+      expect(await caller.safeDiv(MAX_UINT192.div(fp(2)).sub(1), MAX_UINT192, CEIL)).to.equal(1)
+    })
+  })
+
+  describe('safeMulDiv', () => {
+    it('resolves to FIX_MAX', async () => {
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(2), fp(1), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(2), fp(1), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(2), fp(1), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).div(2), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).div(2), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).div(2), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1).div(2), FLOOR)).to.equal(
+        MAX_UINT192
+      )
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1).div(2), ROUND)).to.equal(
+        MAX_UINT192
+      )
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, fp(1).div(2), CEIL)).to.equal(
+        MAX_UINT192
+      )
+
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), fp(1), FLOOR)
+      ).to.equal(MAX_UINT192)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), fp(1), ROUND)
+      ).to.equal(MAX_UINT192)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), fp(1), CEIL)
+      ).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, MAX_UINT192, FLOOR)).to.equal(
+        MAX_UINT192
+      )
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, MAX_UINT192, ROUND)).to.equal(
+        MAX_UINT192
+      )
+      expect(await caller.safeMulDiv(MAX_UINT192, MAX_UINT192, MAX_UINT192, CEIL)).to.equal(
+        MAX_UINT192
+      )
+
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), MAX_UINT192.sub(1), FLOOR)
+      ).to.equal(MAX_UINT192.sub(10))
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), MAX_UINT192.sub(1), ROUND)
+      ).to.equal(MAX_UINT192.sub(10))
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.sub(1), MAX_UINT192.sub(10), MAX_UINT192.sub(1), CEIL)
+      ).to.equal(MAX_UINT192.sub(10))
+
+      expect(await caller.safeMulDiv(fp(1).sub(1), fp(1).add(1), fp(1).sub(1), FLOOR)).to.equal(
+        fp(1).add(1)
+      )
+      expect(await caller.safeMulDiv(fp(1).sub(1), fp(1).add(1), fp(1).sub(1), ROUND)).to.equal(
+        fp(1).add(1)
+      )
+      expect(await caller.safeMulDiv(fp(1).sub(1), fp(1).add(1), fp(1).sub(1), CEIL)).to.equal(
+        fp(1).add(1)
       )
     })
-    it('mulDiv(,,ROUND) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(192), fc.bigUintN(192), fc.bigUintN(192), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = roundDiv(x * y, z)
-          if (UINTMIN <= expected && expected <= UINTMAX) {
-            expect(await caller.mulDivRnd(bn(x), bn(y), bn(z), ROUND)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDivRnd(bn(x), bn(y), bn(z), ROUND)).to.be.reverted
-          }
-        })
-      )
+
+    it('rounds up to FIX_MAX', async () => {
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).sub(1), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).sub(1), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), fp(1).sub(1), CEIL)).to.equal(MAX_UINT192)
+
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), 0, FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), 0, ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeMulDiv(MAX_UINT192, fp(1), 0, CEIL)).to.equal(MAX_UINT192)
+    })
+
+    it('rounds down to 0', async () => {
+      expect(await caller.safeMulDiv(0, fp(1), 0, FLOOR)).to.equal(0)
+      expect(await caller.safeMulDiv(0, fp(1), 0, ROUND)).to.equal(0)
+      expect(await caller.safeMulDiv(0, fp(1), 0, CEIL)).to.equal(0)
+
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.div(fp(1)).sub(1), fp(1), MAX_UINT192, FLOOR)
+      ).to.equal(0)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.div(fp(1)).sub(1), fp(1), MAX_UINT192, ROUND)
+      ).to.equal(1)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.div(fp(2)).sub(1), fp(1), MAX_UINT192, ROUND)
+      ).to.equal(0)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.div(fp(1)).sub(1), fp(1), MAX_UINT192, CEIL)
+      ).to.equal(1)
+      expect(
+        await caller.safeMulDiv(MAX_UINT192.div(fp(2)).sub(1), fp(1), MAX_UINT192, CEIL)
+      ).to.equal(1)
+    })
+  })
+
+  describe('safeDiv_', () => {
+    it('rounds up to FIX_MAX', async () => {
+      expect(await caller.safeDiv_(MAX_UINT192, fp(1).sub(1), FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv_(MAX_UINT192, fp(1).sub(1), ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv_(MAX_UINT192, fp(1).sub(1), CEIL)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv_(MAX_UINT192, 0, FLOOR)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv_(MAX_UINT192, 0, ROUND)).to.equal(MAX_UINT192)
+      expect(await caller.safeDiv_(MAX_UINT192, 0, CEIL)).to.equal(MAX_UINT192)
+    })
+
+    it('rounds down to 0', async () => {
+      expect(await caller.safeDiv_(0, 0, FLOOR)).to.equal(0)
+      expect(await caller.safeDiv_(0, 0, ROUND)).to.equal(0)
+      expect(await caller.safeDiv_(0, 0, CEIL)).to.equal(0)
+      expect(await caller.safeDiv_(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, FLOOR)).to.equal(0)
+      expect(await caller.safeDiv_(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, ROUND)).to.equal(1)
+      expect(await caller.safeDiv_(MAX_UINT192.div(fp(2)).sub(1), MAX_UINT192, ROUND)).to.equal(0)
+      expect(await caller.safeDiv_(MAX_UINT192.div(fp(1)).sub(1), MAX_UINT192, CEIL)).to.equal(1)
+      expect(await caller.safeDiv_(MAX_UINT192.div(fp(2)).sub(1), MAX_UINT192, CEIL)).to.equal(1)
     })
   })
 
@@ -1091,72 +1176,11 @@ describe('In FixLib,', () => {
       expect(await caller.mulDiv256Rnd_(bn(0), bn(0), bn(1), CEIL)).to.equal(bn(0))
       expect(await caller.mulDiv256_(bn(0), bn(0), bn(1))).to.equal(bn(0))
     })
-
-    it('mulDiv256(,,FLOOR) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(256), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = (x * y) / z
-          if (expected < WORD) {
-            expect(await caller.mulDiv256_(bn(x), bn(y), bn(z))).to.equal(bn(expected))
-            expect(await caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), FLOOR)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDiv256_(bn(x), bn(y), bn(z))).to.be.reverted
-            await expect(caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), FLOOR)).to.be.reverted
-          }
-        })
-      )
-    })
-    it('mulDiv256(,,CEIL) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(256), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = ceilDiv(x * y, z)
-          if (expected < WORD) {
-            expect(await caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), CEIL)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), CEIL)).to.be.reverted
-          }
-        })
-      )
-    })
-    it('mulDiv256(,,ROUND) works for many values', async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(256), fc.bigUintN(256), fc.bigUintN(256), async (x, y, z) => {
-          if (z == 0n) return
-          const expected: bigint = roundDiv(x * y, z)
-          if (expected < WORD) {
-            expect(await caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), ROUND)).to.equal(bn(expected))
-          } else {
-            await expect(caller.mulDiv256Rnd_(bn(x), bn(y), bn(z), ROUND)).to.be.reverted
-          }
-        })
-      )
-    })
   })
 
   describe('fullMul', () => {
-    it(`works for many values`, async () => {
-      await fc.assert(
-        fc.asyncProperty(fc.bigUintN(256), fc.bigUintN(256), async (x, y) => {
-          const loExpected = (x * y) % WORD
-          const hiExpected = (x * y) / WORD
-          const [loResult, hiResult] = await caller.fullMul_(BigNumber.from(x), BigNumber.from(y))
-          expect(hiResult).to.equal(hiExpected)
-          expect(loResult).to.equal(loExpected)
-        }),
-        {
-          examples: [
-            [0n, 0n],
-            [0n, 1n],
-            [1n, WORD - 1n],
-            [WORD - 1n, WORD - 1n],
-          ],
-        }
-      )
-    })
     it('fullMul(0,0) = (0,0)', async () => {
-      const [lo, hi]: BigNumber[] = await caller.fullMul_(bn(0), bn(0))
+      const [hi, lo]: BigNumber[] = await caller.fullMul_(bn(0), bn(0))
       expect(lo).to.equal(bn(0))
       expect(hi).to.equal(bn(0))
     })

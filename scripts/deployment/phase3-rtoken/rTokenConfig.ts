@@ -1,6 +1,8 @@
 import { IGovParams, IRTokenConfig, networkConfig } from '../../../common/configuration'
 import { bn, fp } from '../../../common/numbers'
 
+export const RTOKEN_NAME = 'RTKN'
+
 export type IRToken = { [key: string]: IRTokenConfig & IGovParams }
 
 export const rTokenConfig: { [key: string]: IRToken } = {
@@ -10,28 +12,30 @@ export const rTokenConfig: { [key: string]: IRToken } = {
       symbol: 'RTKN',
       mandate: 'mandate',
       params: {
-        rTokenTradingRange: {
-          minVal: fp('1e4'), // $10k
-          maxVal: fp('1e6'), // $1M
-          minAmt: fp('1e3'), // 1k RToken
-          maxAmt: fp('1e6'), // 1M RToken
-        }, // [$0.01, $1M, 0.01 tok, 1M tok]
+        minTradeVolume: fp('1e4'), // $10k
+        rTokenMaxTradeVolume: fp('1e6'), // $1M
         dist: {
           rTokenDist: bn(40), // 2/5 RToken
           rsrDist: bn(60), // 3/5 RSR
         },
-        rewardPeriod: bn('86400'), // 1 day
-        rewardRatio: fp('0.007701635339554948'), // approx. half life of 90 periods
+        rewardRatio: bn('1069671574938'), // approx. half life of 90 days
         unstakingDelay: bn('1209600'), // 2 weeks
+        warmupPeriod: bn('60'), // (the delay _after_ SOUND was regained)
         tradingDelay: bn('14400'), // (the delay _after_ default has been confirmed) 4 hours
-        auctionLength: bn('900'), // 15 minutes
+        batchAuctionLength: bn('900'), // 15 minutes
+        dutchAuctionLength: bn('1800'), // 30 minutes
         backingBuffer: fp('0.0001'), // 0.01%
         maxTradeSlippage: fp('0.01'), // 1%
         shortFreeze: bn('259200'), // 3 days
         longFreeze: bn('2592000'), // 30 days
-        issuanceRate: fp('0.00025'), // 0.025% per block or ~0.1% per minute
-        maxRedemptionCharge: fp('0.05'), // 5% per hour
-        redemptionVirtualSupply: fp('2e7'), // 20M RToken (at $1)
+        issuanceThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
+        redemptionThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
       },
       votingDelay: bn(7200), // in blocks, 1 day
       votingPeriod: bn(14400), // in blocks, 2 days
@@ -47,28 +51,30 @@ export const rTokenConfig: { [key: string]: IRToken } = {
       symbol: 'RTKN',
       mandate: 'mandate',
       params: {
-        rTokenTradingRange: {
-          minVal: fp('1e4'), // $10k
-          maxVal: fp('1e6'), // $1M
-          minAmt: fp('1e3'), // 1k RToken
-          maxAmt: fp('1e6'), // 1M RToken
-        }, // [$0.01, $1M, 0.01 tok, 1M tok]
+        minTradeVolume: fp('1e4'), // $10k
+        rTokenMaxTradeVolume: fp('1e6'), // $1M
         dist: {
           rTokenDist: bn(40), // 2/5 RToken
           rsrDist: bn(60), // 3/5 RSR
         },
-        rewardPeriod: bn('86400'), // 1 day
-        rewardRatio: fp('0.007701635339554948'), // approx. half life of 90 periods
+        rewardRatio: bn('1069671574938'), // approx. half life of 90 days
         unstakingDelay: bn('1209600'), // 2 weeks
+        warmupPeriod: bn('60'), // (the delay _after_ SOUND was regained)
         tradingDelay: bn('14400'), // (the delay _after_ default has been confirmed) 4 hours
-        auctionLength: bn('900'), // 15 minutes
+        batchAuctionLength: bn('900'), // 15 minutes
+        dutchAuctionLength: bn('1800'), // 30 minutes
         backingBuffer: fp('0.0001'), // 0.01%
         maxTradeSlippage: fp('0.01'), // 1%
         shortFreeze: bn('259200'), // 3 days
         longFreeze: bn('2592000'), // 30 days
-        issuanceRate: fp('0.00025'), // 0.025% per block or ~0.1% per minute
-        maxRedemptionCharge: fp('0.05'), // 5% per hour
-        redemptionVirtualSupply: fp('2e7'), // 20M RToken (at $1)
+        issuanceThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
+        redemptionThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
       },
       votingDelay: bn(7200), // in blocks, 1 day
       votingPeriod: bn(14400), // in blocks, 2 days
@@ -83,28 +89,69 @@ export const rTokenConfig: { [key: string]: IRToken } = {
       symbol: 'RTKN',
       mandate: 'mandate',
       params: {
-        rTokenTradingRange: {
-          minVal: bn('0'), // $10k
-          maxVal: bn('0'), // $1M
-          minAmt: fp('1'), // 1k RToken
-          maxAmt: fp('1e9'), // 1M RToken
-        }, // [$0, $0, 1 tok, 1e9 tok]
+        minTradeVolume: fp('1e4'), // $10k
+        rTokenMaxTradeVolume: fp('1e6'), // $1M
         dist: {
           rTokenDist: bn(40), // 2/5 RToken
           rsrDist: bn(60), // 3/5 RSR
         },
-        rewardPeriod: bn('86400'), // 1 day
-        rewardRatio: fp('0.007701635339554948'), // approx. half life of 90 periods
+        rewardRatio: bn('1069671574938'), // approx. half life of 90 days
         unstakingDelay: bn('1209600'), // 2 weeks
+        warmupPeriod: bn('60'), // (the delay _after_ SOUND was regained)
         tradingDelay: bn('0'), // (the delay _after_ default has been confirmed)
-        auctionLength: bn('900'), // 15 minutes
+        batchAuctionLength: bn('900'), // 15 minutes
+        dutchAuctionLength: bn('1800'), // 30 minutes
         backingBuffer: fp('0.0001'), // 0.01%
         maxTradeSlippage: fp('0.01'), // 1%
         shortFreeze: bn('259200'), // 3 days
         longFreeze: bn('2592000'), // 30 days
-        issuanceRate: fp('0.00025'), // 0.025% per block or ~0.1% per minute
-        maxRedemptionCharge: fp('0.05'), // 5% per hour
-        redemptionVirtualSupply: fp('2e7'), // 20M RToken (at $1)
+        issuanceThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
+        redemptionThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
+      },
+      votingDelay: bn(5), // 5 blocks
+      votingPeriod: bn(100), // 100 blocks
+      proposalThresholdAsMicroPercent: bn(5e4), // 0.05%
+      quorumPercent: bn(10), // 10%
+      timelockDelay: bn(1), // 1s
+    },
+  },
+  '84531': {
+    RTKN: {
+      name: 'RToken',
+      symbol: 'RTKN',
+      mandate: 'mandate',
+      params: {
+        minTradeVolume: fp('1e4'), // $10k
+        rTokenMaxTradeVolume: fp('1e6'), // $1M
+        dist: {
+          rTokenDist: bn(40), // 2/5 RToken
+          rsrDist: bn(60), // 3/5 RSR
+        },
+        rewardRatio: bn('1069671574938'), // approx. half life of 90 days
+        unstakingDelay: bn('1209600'), // 2 weeks
+        warmupPeriod: bn('60'), // (the delay _after_ SOUND was regained)
+        tradingDelay: bn('0'), // (the delay _after_ default has been confirmed)
+        withdrawalLeak: bn('5e16'),
+        batchAuctionLength: bn('900'), // 15 minutes
+        dutchAuctionLength: bn('1800'), // 30 minutes
+        backingBuffer: fp('0.0001'), // 0.01%
+        maxTradeSlippage: fp('0.01'), // 1%
+        shortFreeze: bn('259200'), // 3 days
+        longFreeze: bn('2592000'), // 30 days
+        issuanceThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
+        redemptionThrottle: {
+          amtRate: fp('1e6'), // 1M RToken
+          pctRate: fp('0.05'), // 5%
+        },
       },
       votingDelay: bn(5), // 5 blocks
       votingPeriod: bn(100), // 100 blocks

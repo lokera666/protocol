@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
-import "contracts/interfaces/IFacadeWrite.sol";
-import "contracts/facade/lib/FacadeWriteLib.sol";
+import "../interfaces/IFacadeWrite.sol";
+import "./lib/FacadeWriteLib.sol";
 
 /**
  * @title FacadeWrite
  * @notice A UX-friendly layer to interact with the protocol
  * @dev Under the hood, uses two external libs to deal with blocksize limits.
  */
+// slither-disable-start
 contract FacadeWrite is IFacadeWrite {
     using FacadeWriteLib for address;
 
@@ -25,12 +26,22 @@ contract FacadeWrite is IFacadeWrite {
         returns (address)
     {
         // Perform validations
-        require(setup.primaryBasket.length > 0, "no collateral");
+        require(setup.primaryBasket.length != 0, "no collateral");
         require(setup.primaryBasket.length == setup.weights.length, "invalid length");
 
         // Validate backups
         for (uint256 i = 0; i < setup.backups.length; ++i) {
-            require(setup.backups[i].backupCollateral.length > 0, "no backup collateral");
+            require(setup.backups[i].backupCollateral.length != 0, "no backup collateral");
+        }
+
+        // Validate beneficiaries
+        for (uint256 i = 0; i < setup.beneficiaries.length; ++i) {
+            require(
+                setup.beneficiaries[i].beneficiary != address(0) &&
+                    (setup.beneficiaries[i].revShare.rTokenDist != 0 ||
+                        setup.beneficiaries[i].revShare.rsrDist != 0),
+                "beneficiary revShare mismatch"
+            );
         }
 
         // Deploy contracts
@@ -46,10 +57,12 @@ contract FacadeWrite is IFacadeWrite {
 
         // Get Main
         IMain main = rToken.main();
+        IAssetRegistry assetRegistry = main.assetRegistry();
+        IBasketHandler basketHandler = main.basketHandler();
 
         // Register assets
         for (uint256 i = 0; i < setup.assets.length; ++i) {
-            IAssetRegistry(address(main.assetRegistry())).register(setup.assets[i]);
+            require(assetRegistry.register(setup.assets[i]), "duplicate asset");
         }
 
         // Setup basket
@@ -58,20 +71,17 @@ contract FacadeWrite is IFacadeWrite {
 
             // Register collateral
             for (uint256 i = 0; i < setup.primaryBasket.length; ++i) {
-                IAssetRegistry(address(main.assetRegistry())).register(setup.primaryBasket[i]);
+                require(assetRegistry.register(setup.primaryBasket[i]), "duplicate collateral");
                 IERC20 erc20 = setup.primaryBasket[i].erc20();
                 basketERC20s[i] = erc20;
-
-                // Grant allowance
-                main.backingManager().grantRTokenAllowance(erc20);
             }
 
             // Set basket
-            main.basketHandler().setPrimeBasket(basketERC20s, setup.weights);
-            main.basketHandler().refreshBasket();
+            basketHandler.forceSetPrimeBasket(basketERC20s, setup.weights);
+            basketHandler.refreshBasket();
         }
 
-        // Set backup config
+        // Setup backup config
         {
             for (uint256 i = 0; i < setup.backups.length; ++i) {
                 IERC20[] memory backupERC20s = new IERC20[](
@@ -80,11 +90,12 @@ contract FacadeWrite is IFacadeWrite {
 
                 for (uint256 j = 0; j < setup.backups[i].backupCollateral.length; ++j) {
                     ICollateral backupColl = setup.backups[i].backupCollateral[j];
-                    IAssetRegistry(address(main.assetRegistry())).register(backupColl);
-                    backupERC20s[j] = backupColl.erc20();
+                    assetRegistry.register(backupColl); // do not require the asset is new
+                    IERC20 erc20 = backupColl.erc20();
+                    backupERC20s[j] = erc20;
                 }
 
-                main.basketHandler().setBackupConfig(
+                basketHandler.setBackupConfig(
                     setup.backups[i].backupUnit,
                     setup.backups[i].diversityFactor,
                     backupERC20s
@@ -92,8 +103,19 @@ contract FacadeWrite is IFacadeWrite {
             }
         }
 
+        // Setup revshare beneficiaries
+        for (uint256 i = 0; i < setup.beneficiaries.length; ++i) {
+            main.distributor().setDistribution(
+                setup.beneficiaries[i].beneficiary,
+                setup.beneficiaries[i].revShare
+            );
+        }
+
         // Pause until setupGovernance
-        main.pause();
+        main.grantRole(PAUSER, address(this));
+        main.pauseTrading();
+        main.pauseIssuance();
+        main.revokeRole(PAUSER, address(this));
 
         // Setup deployer as owner to complete next step - do not renounce roles yet
         main.grantRole(OWNER, msg.sender);
@@ -109,9 +131,7 @@ contract FacadeWrite is IFacadeWrite {
         bool deployGovernance,
         bool unpause,
         GovernanceParams calldata govParams,
-        address owner,
-        address guardian,
-        address pauser
+        GovernanceRoles calldata govRoles
     ) external returns (address newOwner) {
         // Get Main
         IMain main = rToken.main();
@@ -123,12 +143,13 @@ contract FacadeWrite is IFacadeWrite {
         main.revokeRole(OWNER, msg.sender);
 
         if (deployGovernance) {
-            require(owner == address(0), "owner should be empty");
+            require(govRoles.owner == address(0), "owner should be empty");
 
             TimelockController timelock = new TimelockController(
                 govParams.timelockDelay,
                 new address[](0),
-                new address[](0)
+                new address[](0),
+                address(this)
             );
 
             // Deploy Governance contract
@@ -143,45 +164,51 @@ contract FacadeWrite is IFacadeWrite {
             emit GovernanceCreated(rToken, governance, address(timelock));
 
             // Setup Roles
+            timelock.grantRole(timelock.CANCELLER_ROLE(), governance); // Gov can cancel
+            timelock.grantRole(timelock.CANCELLER_ROLE(), govRoles.guardian); // Guardian can cancel
             timelock.grantRole(timelock.PROPOSER_ROLE(), governance); // Gov only proposer
-            timelock.grantRole(timelock.CANCELLER_ROLE(), guardian); // Guardian as canceller
-            timelock.grantRole(timelock.EXECUTOR_ROLE(), address(0)); // Anyone as executor
+            timelock.grantRole(timelock.EXECUTOR_ROLE(), governance); // Gov only executor
             timelock.revokeRole(timelock.TIMELOCK_ADMIN_ROLE(), address(this)); // Revoke admin role
 
             // Set new owner to timelock
             newOwner = address(timelock);
         } else {
-            require(owner != address(0), "owner not defined");
-            newOwner = owner;
+            require(govRoles.owner != address(0), "owner not defined");
+            newOwner = govRoles.owner;
         }
 
-        // Setup guardian as freeze starter / extender + pauser
-        if (guardian != address(0)) {
-            // As a further decentralization step it is suggested to further differentiate between
-            // these two roles. But this is what will make sense for simple system setup.
-            main.grantRole(SHORT_FREEZER, guardian);
-            main.grantRole(LONG_FREEZER, guardian);
-            main.grantRole(PAUSER, guardian);
+        // Setup pausers
+        for (uint256 i = 0; i < govRoles.pausers.length; ++i) {
+            if (govRoles.pausers[i] != address(0)) {
+                main.grantRole(PAUSER, govRoles.pausers[i]);
+            }
         }
 
-        // Setup Pauser
-        if (pauser != address(0)) {
-            main.grantRole(PAUSER, pauser);
+        // Setup short freezers
+        for (uint256 i = 0; i < govRoles.shortFreezers.length; ++i) {
+            if (govRoles.shortFreezers[i] != address(0)) {
+                main.grantRole(SHORT_FREEZER, govRoles.shortFreezers[i]);
+            }
+        }
+
+        // Setup long freezers
+        for (uint256 i = 0; i < govRoles.longFreezers.length; ++i) {
+            if (govRoles.longFreezers[i] != address(0)) {
+                main.grantRole(LONG_FREEZER, govRoles.longFreezers[i]);
+            }
         }
 
         // Unpause if required
         if (unpause) {
-            main.unpause();
+            main.grantRole(PAUSER, address(this));
+            main.unpauseTrading();
+            main.unpauseIssuance();
+            main.revokeRole(PAUSER, address(this));
         }
 
-        // Transfer Ownership and renounce roles
+        // Transfer Ownership and renounce owner role
         main.grantRole(OWNER, newOwner);
-        main.grantRole(SHORT_FREEZER, newOwner);
-        main.grantRole(LONG_FREEZER, newOwner);
-        main.grantRole(PAUSER, newOwner);
         main.renounceRole(OWNER, address(this));
-        main.renounceRole(SHORT_FREEZER, address(this));
-        main.renounceRole(LONG_FREEZER, address(this));
-        main.renounceRole(PAUSER, address(this));
     }
 }
+// slither-disable-end

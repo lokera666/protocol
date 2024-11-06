@@ -1,28 +1,35 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { BigNumber, Wallet } from 'ethers'
-import { ethers, waffle } from 'hardhat'
+import { BigNumber } from 'ethers'
+import { ethers } from 'hardhat'
 import { IConfig } from '../../common/configuration'
-import { ZERO_ADDRESS, CollateralStatus } from '../../common/constants'
+import { CollateralStatus, TradeKind } from '../../common/constants'
 import { bn, fp } from '../../common/numbers'
-import { setOraclePrice } from '../utils/oracles'
+import { expectPrice, setOraclePrice } from '../utils/oracles'
 import { expectEvents } from '../../common/events'
+import { advanceTime } from '../utils/time'
 import {
   ERC20Mock,
   IAssetRegistry,
-  IBasketHandler,
   MockV3Aggregator,
   SelfReferentialCollateral,
-  OracleLib,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIStRSR,
   TestIRevenueTrader,
   TestIRToken,
   WETH9,
 } from '../../typechain'
-import { defaultFixture, IMPLEMENTATION, ORACLE_TIMEOUT } from '../fixtures'
+import {
+  defaultFixtureNoBasket,
+  IMPLEMENTATION,
+  ORACLE_ERROR,
+  ORACLE_TIMEOUT,
+  PRICE_TIMEOUT,
+} from '../fixtures'
 
-const createFixtureLoader = waffle.createFixtureLoader
+const DELAY_UNTIL_DEFAULT = bn('86400') // 24h
 
 describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}`, () => {
   let owner: SignerWithAddress
@@ -50,18 +57,9 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
   let rToken: TestIRToken
   let assetRegistry: IAssetRegistry
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
-  let oracleLib: OracleLib
+  let basketHandler: TestIBasketHandler
   let rsrTrader: TestIRevenueTrader
   let rTokenTrader: TestIRevenueTrader
-
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
-
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
 
   beforeEach(async () => {
     ;[owner, addr1] = await ethers.getSigners()
@@ -75,53 +73,59 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
       assetRegistry,
       backingManager,
       basketHandler,
-      oracleLib,
       rTokenTrader,
       rsrTrader,
-    } = await loadFixture(defaultFixture))
+    } = await loadFixture(defaultFixtureNoBasket))
 
     await backingManager.connect(owner).setBackingBuffer(0)
 
-    const SelfReferentialFactory = await ethers.getContractFactory('SelfReferentialCollateral', {
-      libraries: { OracleLib: oracleLib.address },
-    })
+    const SelfReferentialFactory = await ethers.getContractFactory('SelfReferentialCollateral')
     const ChainlinkFeedFactory = await ethers.getContractFactory('MockV3Aggregator')
 
     // WETH against ETH
     token0 = await (await ethers.getContractFactory('WETH9')).deploy()
     let chainlinkFeed = <MockV3Aggregator>await ChainlinkFeedFactory.deploy(8, bn('1e8'))
-    collateral0 = await SelfReferentialFactory.deploy(
-      chainlinkFeed.address,
-      token0.address,
-      ZERO_ADDRESS,
-      { minVal: 0, maxVal: 0, minAmt: fp('1'), maxAmt: config.rTokenTradingRange.maxAmt },
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('ETH')
-    )
+    collateral0 = await SelfReferentialFactory.deploy({
+      priceTimeout: PRICE_TIMEOUT,
+      chainlinkFeed: chainlinkFeed.address,
+      oracleError: ORACLE_ERROR,
+      erc20: token0.address,
+      maxTradeVolume: config.rTokenMaxTradeVolume,
+      oracleTimeout: ORACLE_TIMEOUT,
+      targetName: ethers.utils.formatBytes32String('ETH'),
+      defaultThreshold: bn(0),
+      delayUntilDefault: DELAY_UNTIL_DEFAULT,
+    })
 
     // MKR against MKR
     token1 = await (await ethers.getContractFactory('ERC20Mock')).deploy('MKR Token', 'MKR')
     chainlinkFeed = <MockV3Aggregator>await ChainlinkFeedFactory.deploy(8, bn('2e8'))
-    collateral1 = await SelfReferentialFactory.deploy(
-      chainlinkFeed.address,
-      token1.address,
-      ZERO_ADDRESS,
-      { minVal: 0, maxVal: 0, minAmt: fp('1'), maxAmt: config.rTokenTradingRange.maxAmt },
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('MKR')
-    )
+    collateral1 = await SelfReferentialFactory.deploy({
+      priceTimeout: PRICE_TIMEOUT,
+      chainlinkFeed: chainlinkFeed.address,
+      oracleError: ORACLE_ERROR,
+      erc20: token1.address,
+      maxTradeVolume: config.rTokenMaxTradeVolume,
+      oracleTimeout: ORACLE_TIMEOUT,
+      targetName: ethers.utils.formatBytes32String('MKR'),
+      defaultThreshold: bn(0),
+      delayUntilDefault: DELAY_UNTIL_DEFAULT,
+    })
 
     // COMP against COMP
     token2 = await (await ethers.getContractFactory('ERC20Mock')).deploy('COMP Token', 'COMP')
     chainlinkFeed = <MockV3Aggregator>await ChainlinkFeedFactory.deploy(8, bn('4e8'))
-    collateral2 = await SelfReferentialFactory.deploy(
-      chainlinkFeed.address,
-      token2.address,
-      ZERO_ADDRESS,
-      { minVal: 0, maxVal: 0, minAmt: fp('1'), maxAmt: config.rTokenTradingRange.maxAmt },
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('COMP')
-    )
+    collateral2 = await SelfReferentialFactory.deploy({
+      priceTimeout: PRICE_TIMEOUT,
+      chainlinkFeed: chainlinkFeed.address,
+      oracleError: ORACLE_ERROR,
+      erc20: token2.address,
+      maxTradeVolume: config.rTokenMaxTradeVolume,
+      oracleTimeout: ORACLE_TIMEOUT,
+      targetName: ethers.utils.formatBytes32String('COMP'),
+      defaultThreshold: bn(0),
+      delayUntilDefault: DELAY_UNTIL_DEFAULT,
+    })
 
     // Basket configuration
     await assetRegistry.connect(owner).register(collateral0.address)
@@ -135,6 +139,7 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
       [fp('1'), fp('3'), fp('9')] // powers of 3
     )
     await basketHandler.refreshBasket()
+    await advanceTime(config.warmupPeriod.toNumber() + 1)
 
     // Mint initial balances
     await token1.connect(owner).mint(addr1.address, initialBal)
@@ -169,13 +174,16 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
   })
 
   it('should not produce revenue', async () => {
-    expect(await basketHandler.price()).to.equal(price)
+    await expectPrice(basketHandler.address, price, ORACLE_ERROR, true)
     expect(await basketHandler.fullyCollateralized()).to.equal(true)
     expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
+    await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.revertedWith(
+      'already collateralized'
+    )
     await expectEvents(
       backingManager
         .connect(owner)
-        .manageTokens([
+        .forwardRevenue([
           token0.address,
           token1.address,
           token2.address,
@@ -183,11 +191,6 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
           rToken.address,
         ]),
       [
-        {
-          contract: backingManager,
-          name: 'TradeStarted',
-          emitted: false,
-        },
         {
           contract: token0,
           name: 'Transfer',
@@ -215,7 +218,7 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
         },
       ]
     )
-    expect(await basketHandler.price()).to.equal(price)
+    await expectPrice(basketHandler.address, price, ORACLE_ERROR, true)
     expect(await basketHandler.fullyCollateralized()).to.equal(true)
     expect(await basketHandler.status()).to.equal(CollateralStatus.SOUND)
   })
@@ -225,7 +228,7 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
     await setOraclePrice(collateral0.address, bn('1e8').div(2))
     await setOraclePrice(collateral1.address, bn('2e8').div(2))
     await setOraclePrice(collateral2.address, bn('4e8').div(2))
-    expect(await basketHandler.price()).to.equal(price.div(2))
+    await expectPrice(basketHandler.address, price.div(2), ORACLE_ERROR, true)
 
     // Redeem
     await rToken.connect(addr1).redeem(issueAmt)
@@ -254,7 +257,7 @@ describe(`Linear combination of self-referential collateral - P${IMPLEMENTATION}
 
     // Should send donated token to revenue traders
     await expectEvents(
-      backingManager.manageTokens([
+      backingManager.forwardRevenue([
         token0.address,
         token1.address,
         token2.address,

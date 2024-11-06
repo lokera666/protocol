@@ -25,31 +25,15 @@ async function main() {
     chainId,
     deployments.tradingLib,
     [],
-    'contracts/p1/mixins/TradingLib.sol:TradingLibP1'
+    'contracts/p1/mixins/RecollateralizationLib.sol:RecollateralizationLibP1'
   )
 
-  /** ******************** Verify Rewardable Library ****************************************/
+  /** ******************** Verify Basket Library ****************************************/
   await verifyContract(
     chainId,
-    deployments.rewardableLib,
+    deployments.basketLib,
     [],
-    'contracts/p1/mixins/RewardableLib.sol:RewardableLibP1'
-  )
-
-  /** ******************** Verify RTokenPricing Library ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.rTokenPricingLib,
-    [],
-    'contracts/plugins/assets/RTokenPricingLib.sol:RTokenPricingLib'
-  )
-
-  /** ******************** Verify OracleLib Library ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.oracleLib,
-    [],
-    'contracts/plugins/assets/OracleLib.sol:OracleLib'
+    'contracts/p1/mixins/BasketLib.sol:BasketLibP1'
   )
 }
 

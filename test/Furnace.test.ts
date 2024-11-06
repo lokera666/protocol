@@ -1,30 +1,38 @@
+import { loadFixture, setStorageAt } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { BigNumber, ContractFactory, Wallet } from 'ethers'
-import hre, { ethers, upgrades, waffle } from 'hardhat'
-import { IConfig, MAX_PERIOD, MAX_RATIO } from '../common/configuration'
+import { BigNumber, ContractFactory } from 'ethers'
+import hre, { ethers, upgrades } from 'hardhat'
+import { IConfig, MAX_RATIO } from '../common/configuration'
 import { bn, fp } from '../common/numbers'
-import { whileImpersonating } from './utils/impersonation'
 import {
   CTokenMock,
   ERC20Mock,
   StaticATokenMock,
-  TestIBackingManager,
   TestIFurnace,
   TestIMain,
   TestIRToken,
   USDCMock,
 } from '../typechain'
-import { advanceBlocks, advanceTime } from './utils/time'
+import {
+  advanceBlocks,
+  advanceTime,
+  getLatestBlockTimestamp,
+  setNextBlockTimestamp,
+} from './utils/time'
 import { Collateral, defaultFixture, Implementation, IMPLEMENTATION } from './fixtures'
 import { makeDecayFn } from './utils/rewards'
 import snapshotGasCost from './utils/snapshotGasCost'
 import { cartesianProduct } from './utils/cases'
-
-const createFixtureLoader = waffle.createFixtureLoader
+import { ONE_PERIOD, ZERO_ADDRESS } from '../common/constants'
+import { useEnv } from '#/utils/env'
+import { mintCollaterals } from './utils/tokens'
 
 const describeGas =
-  IMPLEMENTATION == Implementation.P1 && process.env.REPORT_GAS ? describe : describe.skip
+  IMPLEMENTATION == Implementation.P1 && useEnv('REPORT_GAS') ? describe.only : describe.skip
+
+const describeExtreme =
+  IMPLEMENTATION == Implementation.P1 && useEnv('EXTREME') ? describe.only : describe.skip
 
 describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
   let owner: SignerWithAddress
@@ -35,7 +43,6 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
   let main: TestIMain
   let furnace: TestIFurnace
   let rToken: TestIRToken
-  let backingManager: TestIBackingManager
   let basket: Collateral[]
 
   // Config
@@ -54,28 +61,44 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
 
   let initialBal: BigNumber
 
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
-
   // Implementation-agnostic interface for deploying the Furnace
   const deployNewFurnace = async (): Promise<TestIFurnace> => {
+    let FurnaceFactory: ContractFactory
+    let furnace: TestIFurnace
     if (IMPLEMENTATION == Implementation.P0) {
-      const FurnaceFactory: ContractFactory = await ethers.getContractFactory('FurnaceP0')
-      return <TestIFurnace>await FurnaceFactory.deploy()
+      FurnaceFactory = await ethers.getContractFactory('FurnaceP0')
+      furnace = <TestIFurnace>await FurnaceFactory.deploy()
     } else if (IMPLEMENTATION == Implementation.P1) {
-      const FurnaceFactory: ContractFactory = await ethers.getContractFactory('FurnaceP1')
-      return <TestIFurnace>await upgrades.deployProxy(FurnaceFactory, [], {
+      FurnaceFactory = await ethers.getContractFactory('FurnaceP1')
+      furnace = <TestIFurnace>await upgrades.deployProxy(FurnaceFactory, [], {
         kind: 'uups',
       })
     } else {
       throw new Error('PROTO_IMPL must be set to either `0` or `1`')
     }
+
+    return furnace
   }
 
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
+  const setFurnace = async (main: TestIMain, furnace: TestIFurnace) => {
+    if (IMPLEMENTATION == Implementation.P0) {
+      // Setup new furnace correctly in MainP0 - Slot 209 (0xD1)
+      await setStorageAt(
+        main.address,
+        '0xD1',
+        ethers.utils.hexlify(ethers.utils.zeroPad(furnace.address, 32))
+      )
+    } else if (IMPLEMENTATION == Implementation.P1) {
+      // Setup new furnace correctly in RTokenP1 - Slot 357 (0x165)
+      await setStorageAt(
+        await main.rToken(),
+        '0x165',
+        ethers.utils.hexlify(ethers.utils.zeroPad(furnace.address, 32))
+      )
+    } else {
+      throw new Error('PROTO_IMPL must be set to either `0` or `1`')
+    }
+  }
 
   beforeEach(async () => {
     ;[owner, addr1, addr2] = await ethers.getSigners()
@@ -97,60 +120,26 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
     token3 = <CTokenMock>await ethers.getContractAt('CTokenMock', await collateral3.erc20())
 
     // Mint Tokens
-    await token0.connect(owner).mint(addr1.address, initialBal)
-    await token1.connect(owner).mint(addr1.address, initialBal)
-    await token2.connect(owner).mint(addr1.address, initialBal)
-    await token3.connect(owner).mint(addr1.address, initialBal)
-
-    await token0.connect(owner).mint(addr2.address, initialBal)
-    await token1.connect(owner).mint(addr2.address, initialBal)
-    await token2.connect(owner).mint(addr2.address, initialBal)
-    await token3.connect(owner).mint(addr2.address, initialBal)
+    await mintCollaterals(owner, [addr1, addr2], initialBal, basket)
   })
 
   describe('Deployment #fast', () => {
     it('Deployment should setup Furnace correctly', async () => {
-      expect(await furnace.period()).to.equal(config.rewardPeriod)
       expect(await furnace.ratio()).to.equal(config.rewardRatio)
       expect(await furnace.lastPayout()).to.be.gt(0) // A timestamp is set
       expect(await furnace.main()).to.equal(main.address)
     })
 
-    it('Deployment does not accept empty period', async () => {
-      const newConfig = JSON.parse(JSON.stringify(config))
-      newConfig.rewardPeriod = bn('0')
-      const newFurnace: TestIFurnace = <TestIFurnace>await deployNewFurnace()
-      await expect(
-        newFurnace.init(main.address, newConfig.rewardPeriod, newConfig.rewardRatio)
-      ).to.be.revertedWith('invalid period')
+    // Applies to all components - used here as an example
+    it('Deployment does not accept invalid main address', async () => {
+      const newFurnace: TestIFurnace = await deployNewFurnace()
+      await expect(newFurnace.init(ZERO_ADDRESS, config.rewardRatio)).to.be.revertedWith(
+        'main is zero address'
+      )
     })
   })
 
   describe('Configuration / State #fast', () => {
-    it('Should allow to update period correctly if Owner and perform validations', async () => {
-      // Setup a new value
-      const newRewardPeriod: BigNumber = bn('100000')
-
-      await expect(furnace.connect(owner).setPeriod(newRewardPeriod))
-        .to.emit(furnace, 'PeriodSet')
-        .withArgs(config.rewardPeriod, newRewardPeriod)
-
-      expect(await furnace.period()).to.equal(newRewardPeriod)
-
-      // Try to update again if not owner
-      await expect(furnace.connect(addr1).setPeriod(bn('500'))).to.be.revertedWith(
-        'governance only'
-      )
-
-      // Cannot update with period zero
-      await expect(furnace.connect(owner).setPeriod(bn('0'))).to.be.revertedWith('invalid period')
-
-      // Cannot update with period > max
-      await expect(furnace.connect(owner).setPeriod(MAX_PERIOD + 1)).to.be.revertedWith(
-        'invalid period'
-      )
-    })
-
     it('Should allow to update ratio correctly if Owner and perform validations', async () => {
       // Setup a new value
       const newRatio: BigNumber = bn('100000')
@@ -169,9 +158,22 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
         'invalid ratio'
       )
     })
+
+    it('Should allow to update ratio correctly if frozen', async () => {
+      // Setup a new value
+      const newRatio: BigNumber = bn('100000')
+
+      await main.freezeShort()
+
+      await expect(furnace.connect(owner).setRatio(newRatio))
+        .to.emit(furnace, 'RatioSet')
+        .withArgs(config.rewardRatio, newRatio)
+
+      expect(await furnace.ratio()).to.equal(newRatio)
+    })
   })
 
-  describe('Do Melt #fast', () => {
+  describe('Do Melt', () => {
     beforeEach(async () => {
       // Approvals for issuance
       await token0.connect(addr1).approve(rToken.address, initialBal)
@@ -190,17 +192,22 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
       await rToken.connect(addr2).issue(issueAmount)
     })
 
-    it('Should not melt if paused', async () => {
-      await main.connect(owner).pause()
-      await expect(furnace.connect(addr1).melt()).to.be.revertedWith('paused or frozen')
+    it('Should melt if trading paused #fast', async () => {
+      await main.connect(owner).pauseTrading()
+      await furnace.connect(addr1).melt()
     })
 
-    it('Should not melt if frozen', async () => {
+    it('Should melt if issuance paused #fast', async () => {
+      await main.connect(owner).pauseIssuance()
+      await furnace.connect(addr1).melt()
+    })
+
+    it('Should melt if frozen #fast', async () => {
       await main.connect(owner).freezeShort()
-      await expect(furnace.connect(addr1).melt()).to.be.revertedWith('paused or frozen')
+      await furnace.connect(addr1).melt()
     })
 
-    it('Should not melt any funds in the initial block', async () => {
+    it('Should not melt any funds in the initial block #fast', async () => {
       const hndAmt: BigNumber = bn('2e18')
 
       // Set automine to false for multiple transactions in one block
@@ -223,16 +230,12 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
       await hre.network.provider.send('evm_setAutomine', [true])
     })
 
-    it('Should not melt if no funds available', async () => {
-      // Set time period
-      const period: number = 60 * 60 * 24 // 1 day
-      await furnace.connect(owner).setPeriod(period)
-
+    it('Should not melt if no funds available #fast', async () => {
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal)
       expect(await rToken.balanceOf(furnace.address)).to.equal(0)
 
-      // Advance to the end to melt full amount
-      await advanceTime(period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
 
       // Melt
       await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
@@ -242,12 +245,8 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
       expect(await rToken.balanceOf(furnace.address)).to.equal(0)
     })
 
-    it('Should melt 0 for first period, even if funds available', async () => {
+    it('Should melt 0 for first period, even if funds available #fast', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
@@ -256,175 +255,296 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
       expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
 
       // Advance one period
-      await advanceTime(period + 1)
+      await advanceTime(1)
 
       // Melt
-      await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
-
-      // Another call to melt should also have no impact
       await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
 
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
       expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
     })
 
-    it('Should allow melt - one period', async () => {
+    it('Should allow melt - one period #fast', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
 
       // Get past first noop melt
-      await advanceTime(period + 1)
+      await advanceTime(1)
+
       await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
 
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
       expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
 
-      // Advance to the end to melt full amount
-      await advanceTime(period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
 
       const decayFn = makeDecayFn(await furnace.ratio())
-      const expAmt = decayFn(hndAmt, 1) // 1 period
+      const expAmt = decayFn(hndAmt, 1)
 
       // Melt
       await expect(furnace.connect(addr1).melt())
         .to.emit(rToken, 'Melted')
         .withArgs(hndAmt.sub(expAmt))
 
-      // Another call to melt should have no impact
-      await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
+      // Another call to melt right away in a separate block will also melt
+      await expect(furnace.connect(addr1).melt()).to.emit(rToken, 'Melted')
 
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
-      expect(await rToken.balanceOf(furnace.address)).to.equal(expAmt)
+      expect(await rToken.balanceOf(furnace.address)).to.be.lt(expAmt) // additional melting occurred
     })
 
-    it('Should allow melt - two periods, all at once', async () => {
+    it('Should allow melt - two periods, one at a time #fast', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
 
       // Get past first noop melt
-      await advanceTime(period + 1)
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
+
       await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
 
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
       expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
 
-      // Advance to the end to melt full amount
-      await advanceTime(2 * period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
 
       const decayFn = makeDecayFn(await furnace.ratio())
-      const expAmt = decayFn(hndAmt, 2) // 2 periods
-
-      await expect(furnace.melt()).to.emit(rToken, 'Melted').withArgs(hndAmt.sub(expAmt))
-
-      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
-      expect(await rToken.balanceOf(furnace.address)).to.equal(expAmt)
-    })
-
-    it('Should allow melt - two periods, one at a time', async () => {
-      const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
-
-      // Transfer
-      await rToken.connect(addr1).transfer(furnace.address, hndAmt)
-
-      // Get past first noop melt
-      await advanceTime(period + 1)
-      await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
-
-      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
-      expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
-
-      // Advance to the end to melt full amount
-      await advanceTime(period + 1)
-
-      const decayFn = makeDecayFn(await furnace.ratio())
-      const expAmt1 = decayFn(hndAmt, 1) // 1 period
+      const expAmt1 = decayFn(hndAmt, 1)
 
       // Melt
       await expect(furnace.connect(addr1).melt())
         .to.emit(rToken, 'Melted')
         .withArgs(hndAmt.sub(expAmt1))
 
-      // Advance to the end to withdraw full amount
-      await advanceTime(period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
 
-      const expAmt2 = decayFn(hndAmt, 2) // 2 periods
+      const expAmt2 = decayFn(hndAmt, 2)
 
       // Melt
-      await expect(furnace.connect(addr1).melt())
-        .to.emit(rToken, 'Melted')
-        .withArgs(bn(expAmt1).sub(expAmt2))
+      await expect(furnace.connect(addr1).melt()).to.emit(rToken, 'Melted')
 
       expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
-      expect(await rToken.balanceOf(furnace.address)).to.equal(expAmt2)
+      expect(await rToken.balanceOf(furnace.address)).to.be.closeTo(expAmt2, 1) // within 1
+      expect(await rToken.balanceOf(furnace.address)).to.be.gte(expAmt2) // defensive rounding
+    })
+
+    it('Should melt before updating the ratio #fast', async () => {
+      const hndAmt: BigNumber = bn('10e18')
+
+      // Transfer
+      await rToken.connect(addr1).transfer(furnace.address, hndAmt)
+
+      // Get past first noop melt
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
+
+      await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
+
+      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
+      expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
+
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
+
+      const decayFn = makeDecayFn(await furnace.ratio())
+      const expAmt = decayFn(hndAmt, 1)
+
+      // Melt
+      await expect(furnace.setRatio(bn('1e13')))
+        .to.emit(rToken, 'Melted')
+        .withArgs(hndAmt.sub(expAmt))
+
+      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
+      expect(await rToken.balanceOf(furnace.address)).to.be.equal(expAmt)
+    })
+
+    it('Should accumulate negligible error - a year all at once', async () => {
+      const hndAmt: BigNumber = bn('10e18')
+
+      // Transfer
+      await rToken.connect(addr1).transfer(furnace.address, hndAmt)
+
+      // Get past first noop melt
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + 1)
+      await expect(furnace.connect(addr1).melt()).to.not.emit(rToken, 'Melted')
+      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
+      expect(await rToken.balanceOf(furnace.address)).to.equal(hndAmt)
+
+      const periods = 60 * 60 * 24 * 365 // one year worth
+
+      // Advance a year's worth of periods
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + periods)
+
+      const decayFn = makeDecayFn(await furnace.ratio())
+      const expAmt = decayFn(hndAmt, periods)
+      await expect(furnace.melt()).to.emit(rToken, 'Melted').withArgs(hndAmt.sub(expAmt))
+      expect(await rToken.balanceOf(addr1.address)).to.equal(initialBal.sub(hndAmt))
+      expect(await rToken.balanceOf(furnace.address)).to.equal(expAmt)
+    })
+
+    it('Should accumulate negligible error - parallel furnaces', async () => {
+      // Maintain two furnaces in parallel, one burning every second and one burning once per hour
+      // We have to use two brand new instances here to ensure their timestamps are synced
+      const firstFurnace = await deployNewFurnace()
+      const secondFurnace = await deployNewFurnace()
+
+      // Set automine to false for multiple transactions in one block
+      await hre.network.provider.send('evm_setAutomine', [false])
+
+      // Populate balances
+      const hndAmt: BigNumber = bn('1e18')
+      await rToken.connect(addr1).transfer(firstFurnace.address, hndAmt)
+      await rToken.connect(addr1).transfer(secondFurnace.address, hndAmt)
+      await firstFurnace.init(main.address, config.rewardRatio)
+      await secondFurnace.init(main.address, config.rewardRatio)
+      await advanceBlocks(1)
+
+      // Simulate an hour
+      const oneHour = 3600
+      await setFurnace(main, firstFurnace)
+      const before = await getLatestBlockTimestamp()
+      for (let i = 0; i < oneHour; i++) {
+        // Advance a second each block, as if we're on an L2 or something fast
+        await firstFurnace.melt()
+        await setNextBlockTimestamp(before + 1 + i)
+        await advanceBlocks(1)
+        // secondFurnace does not melt
+      }
+
+      await setFurnace(main, secondFurnace)
+
+      // Set automine to true
+      await hre.network.provider.send('evm_setAutomine', [true])
+
+      // Melt furnace 2
+      await setNextBlockTimestamp((await getLatestBlockTimestamp()) + 1)
+      await secondFurnace.melt()
+
+      // Expected to be off by 1 rewardRatio worth of RToken
+      const one = await rToken.balanceOf(firstFurnace.address)
+      const two = await rToken.balanceOf(secondFurnace.address)
+      expect(one).to.be.gte(two)
+      expect(one).to.be.closeTo(two, config.rewardRatio)
+    })
+
+    it('Regression test -- C4 June 2023 Issue #29', async () => {
+      // https://github.com/code-423n4/2023-06-reserve-findings/issues/29
+
+      const firstRatio = fp('1e-6')
+      const secondRatio = fp('1e-4')
+      const mintAmount = fp('100')
+
+      // Set ratio to something cleaner
+      await expect(furnace.connect(owner).setRatio(firstRatio))
+        .to.emit(furnace, 'RatioSet')
+        .withArgs(config.rewardRatio, firstRatio)
+
+      // Transfer to Furnace and do first melt
+      await rToken.connect(addr1).transfer(furnace.address, mintAmount)
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
+      await furnace.melt()
+
+      // Should have updated lastPayout + lastPayoutBal
+      expect(await furnace.lastPayout()).to.be.closeTo(await getLatestBlockTimestamp(), 12)
+      expect(await furnace.lastPayout()).to.be.lte(await getLatestBlockTimestamp())
+      expect(await furnace.lastPayoutBal()).to.equal(mintAmount)
+
+      // Advance 100 periods -- should melt at old ratio
+      await setNextBlockTimestamp(
+        Number(await getLatestBlockTimestamp()) + 100 * Number(ONE_PERIOD)
+      )
+
+      // Freeze and change ratio (melting as a pre-step)
+      await main.connect(owner).freezeForever()
+      await expect(furnace.connect(owner).setRatio(secondRatio))
+        .to.emit(furnace, 'RatioSet')
+        .withArgs(firstRatio, secondRatio)
+
+      // Should have melted
+      expect(await furnace.lastPayout()).to.be.closeTo(await getLatestBlockTimestamp(), 12)
+      expect(await furnace.lastPayout()).to.be.lte(await getLatestBlockTimestamp())
+      expect(await furnace.lastPayoutBal()).to.eq(fp('99.989900504983335400'))
+
+      // Unfreeze and advance 100 periods
+      await main.connect(owner).unfreeze()
+      await setNextBlockTimestamp(
+        Number(await getLatestBlockTimestamp()) + 100 * Number(ONE_PERIOD)
+      )
+      await expect(furnace.melt()).to.emit(rToken, 'Melted')
+
+      // Should have updated lastPayout + lastPayoutBal and melted at new ratio
+      expect(await furnace.lastPayout()).to.be.closeTo(await getLatestBlockTimestamp(), 12)
+      expect(await furnace.lastPayout()).to.be.lte(await getLatestBlockTimestamp())
+      expect(await furnace.lastPayoutBal()).to.equal(fp('98.985035377287638455'))
+
+      // Total supply should have decreased by the cumulative melted amount
+      expect(await rToken.totalSupply()).to.equal(mintAmount.add(await furnace.lastPayoutBal()))
+      expect(await rToken.basketsNeeded()).to.equal(mintAmount.mul(2))
     })
   })
 
-  describe('Extreme Bounds', () => {
-    const applyParameters = async (
-      period: BigNumber,
-      ratio: BigNumber,
-      bal: BigNumber
-    ): Promise<TestIFurnace> => {
+  describeExtreme('Extreme Bounds', () => {
+    const applyParameters = async (ratio: BigNumber, bal: BigNumber): Promise<TestIFurnace> => {
       // Deploy fixture
-      ;({ main, rToken, backingManager, furnace } = await loadFixture(defaultFixture))
+      ;({ main, rToken, furnace } = await loadFixture(defaultFixture))
 
-      await furnace.connect(owner).setPeriod(period)
       await furnace.connect(owner).setRatio(ratio)
+
+      const max256 = bn(2).pow(256).sub(1)
+      await token0.connect(owner).mint(addr1.address, max256)
+      await token1.connect(owner).mint(addr1.address, max256)
+      await token2.connect(owner).mint(addr1.address, max256)
+      await token3.connect(owner).mint(addr1.address, max256)
+      await token0.connect(addr1).approve(rToken.address, max256)
+      await token1.connect(addr1).approve(rToken.address, max256)
+      await token2.connect(addr1).approve(rToken.address, max256)
+      await token3.connect(addr1).approve(rToken.address, max256)
+
+      // Set up larger throttles
+      const throttle = { amtRate: bal.lt(fp('1')) ? fp('1') : bal, pctRate: 0 }
+      await rToken.connect(owner).setIssuanceThrottleParams(throttle)
+      await rToken.connect(owner).setRedemptionThrottleParams(throttle)
+      await advanceTime(3600)
 
       // Issue and send tokens to furnace
       if (bal.gt(bn('0'))) {
-        await whileImpersonating(backingManager.address, async (bmSigner) => {
-          // Create new bal
-          await rToken.connect(bmSigner).mint(furnace.address, bal)
-        })
+        await rToken.connect(addr1).issue(bal)
       }
 
-      // Charge battery
-      await rToken.connect(owner).setRedemptionVirtualSupply(bal)
-      await advanceBlocks(300)
+      // Charge throttles
+      await advanceTime(3600)
 
       return furnace
     }
 
     it('Should not revert at extremes', async () => {
-      // max: 1 year
-      const periods = [bn(MAX_PERIOD), bn('1'), bn('604800')]
-
-      const ratios = [fp('1'), fp('0'), fp('0.02284')]
+      const ratios = [bn('1e14'), fp('0'), fp('0.000001069671574938')]
 
       const bals = [fp('1e18'), fp('0'), bn('1e9')]
 
-      const cases = cartesianProduct(periods, ratios, bals)
+      const cases = cartesianProduct(ratios, bals)
       for (let i = 0; i < cases.length; i++) {
         const args: BigNumber[] = cases[i]
-        const period = args[0]
-        const ratio = args[1]
-        const bal = args[2]
+        const ratio = args[0]
+        const bal = args[1]
 
-        const newFurnace: TestIFurnace = <TestIFurnace>await applyParameters(period, ratio, bal)
+        const newFurnace: TestIFurnace = <TestIFurnace>await applyParameters(ratio, bal)
 
         // Should melt after 1 period
-        await advanceTime(period.add(1).toString())
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + 10 * Number(ONE_PERIOD)
+        )
         await newFurnace.melt()
 
         // Should melt after 1000 periods
-        await advanceTime(period.mul(1000).add(1).toString())
+        await setNextBlockTimestamp(
+          Number(await getLatestBlockTimestamp()) + 1000 * Number(ONE_PERIOD)
+        )
         await newFurnace.melt()
       }
     })
@@ -454,23 +574,20 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
 
     it('Melt - One period ', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
 
       // Call with no impact
       await snapshotGasCost(furnace.connect(addr1).melt())
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
 
       // Get past first noop melt
-      await advanceTime(period + 1)
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
+
       await snapshotGasCost(furnace.connect(addr1).melt())
 
-      // Advance to the end to melt full amount
-      await advanceTime(period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
 
       const decayFn = makeDecayFn(await furnace.ratio())
       const expAmt = decayFn(hndAmt, 1) // 1 period
@@ -485,24 +602,24 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
       expect(await rToken.balanceOf(furnace.address)).to.equal(expAmt)
     })
 
-    it('Melt - Many periods, all at once', async () => {
+    it('Melt - A million periods, all at once', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
+      const numPeriods = bn('1e6')
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
 
       // Get past first noop melt
-      await advanceTime(period + 1)
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
+
       await snapshotGasCost(furnace.connect(addr1).melt())
-      // Advance to the end to melt full amount
-      await advanceTime(10 * period + 1)
+      // Advance 1s
+      await setNextBlockTimestamp(
+        Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD.mul(numPeriods))
+      )
 
       const decayFn = makeDecayFn(await furnace.ratio())
-      const expAmt = decayFn(hndAmt, 10) // 10 periods
+      const expAmt = decayFn(hndAmt, Number(numPeriods)) // 10 periods
 
       await snapshotGasCost(furnace.connect(addr1).melt())
 
@@ -512,21 +629,19 @@ describe(`FurnaceP${IMPLEMENTATION} contract`, () => {
 
     it('Melt - Many periods, one after the other', async () => {
       const hndAmt: BigNumber = bn('10e18')
-      const period: number = 60 * 60 * 24 // 1 day
-
-      // Set time period
-      await furnace.connect(owner).setPeriod(period)
 
       // Transfer
       await rToken.connect(addr1).transfer(furnace.address, hndAmt)
 
       // Get past first noop melt
-      await advanceTime(period + 1)
+      await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
+
       await snapshotGasCost(furnace.connect(addr1).melt())
 
       // Melt 10 periods
       for (let i = 1; i <= 10; i++) {
-        await advanceTime(period + 1)
+        await setNextBlockTimestamp(Number(await getLatestBlockTimestamp()) + Number(ONE_PERIOD))
+
         await snapshotGasCost(furnace.connect(addr1).melt())
       }
 

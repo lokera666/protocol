@@ -16,7 +16,9 @@ export const pow10 = (exponent: BigNumberish): BigNumber => {
 // Convert `x` to a new BigNumber with decimals = `decimals`.
 // Input should have SCALE_DECIMALS (18) decimal places, and `decimals` should be less than 18.
 export const toBNDecimals = (x: BigNumberish, decimals: number): BigNumber => {
-  return BigNumber.from(x).div(pow10(SCALE_DECIMALS - decimals))
+  return decimals < SCALE_DECIMALS
+    ? BigNumber.from(x).div(pow10(SCALE_DECIMALS - decimals))
+    : BigNumber.from(x).mul(pow10(decimals - SCALE_DECIMALS))
 }
 
 // Convert to the BigNumber representing a Fix from a BigNumberish.
@@ -32,6 +34,8 @@ export const fp = (x: BigNumberish): BigNumber => {
 }
 
 export const divFloor = (x: BigNumber, y: BigNumber): BigNumber => div(x, y, RoundingMode.FLOOR)
+
+export const divRound = (x: BigNumber, y: BigNumber): BigNumber => div(x, y, RoundingMode.ROUND)
 
 export const divCeil = (x: BigNumber, y: BigNumber): BigNumber => div(x, y, RoundingMode.CEIL)
 

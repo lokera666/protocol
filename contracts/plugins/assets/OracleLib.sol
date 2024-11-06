@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
-import "contracts/libraries/Fixed.sol";
+import "../../libraries/Fixed.sol";
+import "./OracleErrors.sol";
 
-error StalePrice();
-error PriceOutsideRange();
+interface EACAggregatorProxy {
+    function aggregator() external view returns (address);
+}
 
 /// Used by asset plugins to price their collateral
 library OracleLib {
-    /// @dev Use for on-the-fly calculations that should revert
+    uint48 internal constant ORACLE_TIMEOUT_BUFFER = 300; // {s} 5 minutes
+
+    /// @dev Use for nested calls that should revert when there is a problem
     /// @param timeout The number of seconds after which oracle values should be considered stale
     /// @return {UoA/tok}
     function price(AggregatorV3Interface chainlinkFeed, uint48 timeout)
@@ -17,31 +21,41 @@ library OracleLib {
         view
         returns (uint192)
     {
-        (uint80 roundId, int256 p, , uint256 updateTime, uint80 answeredInRound) = chainlinkFeed
-            .latestRoundData();
+        try chainlinkFeed.latestRoundData() returns (
+            uint80 roundId,
+            int256 p,
+            uint256,
+            uint256 updateTime,
+            uint80 answeredInRound
+        ) {
+            if (updateTime == 0 || answeredInRound < roundId) {
+                revert StalePrice();
+            }
 
-        if (updateTime == 0 || answeredInRound < roundId) {
-            revert StalePrice();
+            // Downcast is safe: uint256(-) reverts on underflow; block.timestamp assumed < 2^48
+            uint48 secondsSince = uint48(block.timestamp - updateTime);
+            if (secondsSince > timeout + ORACLE_TIMEOUT_BUFFER) revert StalePrice();
+
+            if (p <= 0) revert InvalidPrice();
+
+            // {UoA/tok}
+            return shiftl_toFix(uint256(p), -int8(chainlinkFeed.decimals()));
+        } catch (bytes memory errData) {
+            // Check if the aggregator was not set: if so, the chainlink feed has been deprecated
+            // and a _specific_ error needs to be raised in order to avoid looking like OOG
+            if (errData.length == 0) {
+                if (EACAggregatorProxy(address(chainlinkFeed)).aggregator() == address(0)) {
+                    revert StalePrice();
+                }
+                // solhint-disable-next-line reason-string
+                revert();
+            }
+
+            // Otherwise, preserve the error bytes
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(add(32, errData), mload(errData))
+            }
         }
-        // Downcast is safe: uint256(-) reverts on underflow; block.timestamp assumed < 2^48
-        uint48 secondsSince = uint48(block.timestamp - updateTime);
-        if (secondsSince > timeout) revert StalePrice();
-
-        // {UoA/tok}
-        uint192 scaledPrice = shiftl_toFix(uint256(p), -int8(chainlinkFeed.decimals()));
-
-        if (scaledPrice == 0) revert PriceOutsideRange();
-        return scaledPrice;
-    }
-
-    /// @dev Use when a try-catch is necessary
-    /// @param timeout The number of seconds after which oracle values should be considered stale
-    /// @return {UoA/tok}
-    function price_(AggregatorV3Interface chainlinkFeed, uint48 timeout)
-        external
-        view
-        returns (uint192)
-    {
-        return price(chainlinkFeed, timeout);
     }
 }

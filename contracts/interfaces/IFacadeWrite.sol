@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "./IDeployer.sol";
 
@@ -28,6 +28,8 @@ struct SetupParams {
     uint192[] weights;
     // === Basket Backup ===
     BackupInfo[] backups;
+    // === Beneficiaries - Revenue Sharing ===
+    BeneficiaryInfo[] beneficiaries;
 }
 
 /**
@@ -41,15 +43,36 @@ struct BackupInfo {
 }
 
 /**
+ * @title BeneficiaryInfo
+ * @notice The set of params to define a beneficiary
+ */
+struct BeneficiaryInfo {
+    address beneficiary;
+    RevenueShare revShare;
+}
+
+/**
  * @title GovernanceParams
  * @notice The set of params required to setup decentralized governance
  */
 struct GovernanceParams {
-    uint256 votingDelay; // in blocks
-    uint256 votingPeriod; // in blocks
+    uint256 votingDelay; // in {s}
+    uint256 votingPeriod; // in {s}
     uint256 proposalThresholdAsMicroPercent; // e.g. 1e4 for 0.01%
     uint256 quorumPercent; // e.g 4 for 4%
-    uint256 timelockDelay; // in seconds (used for timelock)
+    uint256 timelockDelay; // in {s} (used for timelock)
+}
+
+/**
+ * @title GovernanceRoles
+ * @notice The set of roles required (owner, guardian, pausers, and freezers)
+ */
+struct GovernanceRoles {
+    address owner;
+    address guardian;
+    address[] pausers;
+    address[] shortFreezers;
+    address[] longFreezers;
 }
 
 /**
@@ -78,8 +101,6 @@ interface IFacadeWrite {
         bool deployGovernance,
         bool unfreeze,
         GovernanceParams calldata govParams,
-        address owner,
-        address guardian,
-        address pauser
+        GovernanceRoles calldata govRoles
     ) external returns (address);
 }

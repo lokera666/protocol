@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "contracts/libraries/Fixed.sol";
+import "../libraries/Fixed.sol";
 import "./IMain.sol";
+import "./IRewardable.sol";
 
-/// A range of whole token quantities to bound trading
-struct TradingRange {
-    /// Used when prices are available
-    uint192 minVal; // {UoA}
-    uint192 maxVal; // {UoA}
-    // Always applied
-    uint192 minAmt; // {tok}
-    uint192 maxAmt; // {tok}
+// Not used directly in the IAsset interface, but used by many consumers to save stack space
+struct Price {
+    uint192 low; // {UoA/tok}
+    uint192 high; // {UoA/tok}
 }
 
 /**
@@ -22,9 +19,25 @@ struct TradingRange {
  * whether it is used as RToken backing or not. Any token that can report a price in the UoA
  * is eligible to be an asset.
  */
-interface IAsset {
-    /// @return {UoA/tok} Our best guess at the market price of 1 whole token in the UoA
-    function price() external view returns (uint192);
+interface IAsset is IRewardable {
+    /// Refresh saved price
+    /// The Reserve protocol calls this at least once per transaction, before relying on
+    /// the Asset's other functions.
+    /// @dev Called immediately after deployment, before use
+    function refresh() external;
+
+    /// Should not revert
+    /// low should be nonzero if the asset could be worth selling
+    /// @return low {UoA/tok} The lower end of the price estimate
+    /// @return high {UoA/tok} The upper end of the price estimate
+    function price() external view returns (uint192 low, uint192 high);
+
+    /// Should not revert
+    /// lotLow should be nonzero when the asset might be worth selling
+    /// @dev Deprecated. Phased out in 3.1.0, but left on interface for backwards compatibility
+    /// @return lotLow {UoA/tok} The lower end of the lot price estimate
+    /// @return lotHigh {UoA/tok} The upper end of the lot price estimate
+    function lotPrice() external view returns (uint192 lotLow, uint192 lotHigh);
 
     /// @return {tok} The balance of the ERC20 in whole tokens
     function bal(address account) external view returns (uint192);
@@ -32,40 +45,49 @@ interface IAsset {
     /// @return The ERC20 contract of the token with decimals() available
     function erc20() external view returns (IERC20Metadata);
 
+    /// @return The number of decimals in the ERC20; just for gas optimization
+    function erc20Decimals() external view returns (uint8);
+
     /// @return If the asset is an instance of ICollateral or not
     function isCollateral() external view returns (bool);
 
-    /// @return {tok} The minimium trade size
-    function minTradeSize() external view returns (uint192);
+    /// @return {UoA} The max trade volume, in UoA
+    function maxTradeVolume() external view returns (uint192);
 
-    /// @return {tok} The maximum trade size
-    function maxTradeSize() external view returns (uint192);
-
-    // ==== Rewards ====
-
-    /// Get the message needed to call in order to claim rewards for holding this asset.
-    /// Returns zero values if there is no reward function to call.
-    /// @return _to The address to send the call to
-    /// @return _calldata The calldata to send
-    function getClaimCalldata() external view returns (address _to, bytes memory _calldata);
-
-    /// The ERC20 token address that this Asset's rewards are paid in.
-    /// If there are no rewards, will return a zero value.
-    function rewardERC20() external view returns (IERC20 reward);
+    /// @return {s} The timestamp of the last refresh() that saved prices
+    function lastSave() external view returns (uint48);
 }
 
+// Used only in Testing. Strictly speaking an Asset does not need to adhere to this interface
 interface TestIAsset is IAsset {
+    /// @return The address of the chainlink feed
     function chainlinkFeed() external view returns (AggregatorV3Interface);
+
+    /// {1} The max % deviation allowed by the oracle
+    function oracleError() external view returns (uint192);
+
+    /// @return {s} Seconds that an oracle value is considered valid
+    function oracleTimeout() external view returns (uint48);
+
+    /// @return {s} The maximum of all oracle timeouts on the plugin
+    function maxOracleTimeout() external view returns (uint48);
+
+    /// @return {s} Seconds that the price() should decay over, after stale price
+    function priceTimeout() external view returns (uint48);
+
+    /// @return {UoA/tok} The last saved low price
+    function savedLowPrice() external view returns (uint192);
+
+    /// @return {UoA/tok} The last saved high price
+    function savedHighPrice() external view returns (uint192);
 }
 
 /// CollateralStatus must obey a linear ordering. That is:
-/// - being DISABLED is worse than being UNPRICED, IFFY, or SOUND
-/// - being UNPRICED is worse than being IFFY or SOUND
+/// - being DISABLED is worse than being IFFY, or SOUND
 /// - being IFFY is worse than being SOUND.
 enum CollateralStatus {
     SOUND,
-    IFFY, // When a peg is not holding
-    UNPRICED, // When a problem is detected with the chainlink feed
+    IFFY, // When a peg is not holding or a chainlink feed is stale
     DISABLED // When the collateral has completely defaulted
 }
 
@@ -73,19 +95,7 @@ enum CollateralStatus {
 library CollateralStatusComparator {
     /// @return Whether a is worse than b
     function worseThan(CollateralStatus a, CollateralStatus b) internal pure returns (bool) {
-        // Short-circuit the normal case
-        if (a == CollateralStatus.SOUND) return false;
-
-        // This is written out in order to make it harder to accidentally expand the enum
-        // without thinking about linear ordering constraints.
-        return
-            (a == CollateralStatus.IFFY && b == CollateralStatus.SOUND) ||
-            (a == CollateralStatus.UNPRICED &&
-                (b == CollateralStatus.SOUND || b == CollateralStatus.IFFY)) ||
-            (a == CollateralStatus.DISABLED &&
-                (b == CollateralStatus.SOUND ||
-                    b == CollateralStatus.IFFY ||
-                    b == CollateralStatus.UNPRICED));
+        return uint256(a) > uint256(b);
     }
 }
 
@@ -97,18 +107,15 @@ interface ICollateral is IAsset {
     /// Emitted whenever the collateral status is changed
     /// @param newStatus The old CollateralStatus
     /// @param newStatus The updated CollateralStatus
-    event DefaultStatusChanged(
+    event CollateralStatusChanged(
         CollateralStatus indexed oldStatus,
         CollateralStatus indexed newStatus
     );
 
+    /// @dev refresh()
     /// Refresh exchange rates and update default status.
-    /// The Reserve protocol calls this at least once per transaction, before relying on
-    /// this collateral's prices or default status.
-    /// @dev This default check assumes that the collateral's price() value is expected
-    /// to stay close to pricePerTarget() * targetPerRef(). If that's not true for the
-    /// collateral you're defining, you MUST redefine refresh()!!
-    function refresh() external;
+    /// VERY IMPORTANT: In any valid implemntation, status() MUST become DISABLED in refresh() if
+    /// refPerTok() has ever decreased since last call.
 
     /// @return The canonical name of this collateral's target unit.
     function targetName() external view returns (bytes32);
@@ -123,7 +130,16 @@ interface ICollateral is IAsset {
 
     /// @return {target/ref} Quantity of whole target units per whole reference unit in the peg
     function targetPerRef() external view returns (uint192);
+}
 
-    /// @return {UoA/target} The price of the target unit in UoA (usually this is {UoA/UoA} = 1)
-    function pricePerTarget() external view returns (uint192);
+// Used only in Testing. Strictly speaking a Collateral does not need to adhere to this interface
+interface TestICollateral is TestIAsset, ICollateral {
+    /// @return The epoch timestamp when the collateral will default from IFFY to DISABLED
+    function whenDefault() external view returns (uint256);
+
+    /// @return The amount of time a collateral must be in IFFY status until being DISABLED
+    function delayUntilDefault() external view returns (uint48);
+
+    /// @return The underlying refPerTok, likely not included in all collaterals however.
+    function underlyingRefPerTok() external view returns (uint192);
 }

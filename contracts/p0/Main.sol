@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "contracts/libraries/Fixed.sol";
-import "contracts/interfaces/IMain.sol";
-import "contracts/mixins/ComponentRegistry.sol";
-import "contracts/mixins/Auth.sol";
+import "../interfaces/IMain.sol";
+import "../mixins/ComponentRegistry.sol";
+import "../mixins/Auth.sol";
+import "../mixins/Versioned.sol";
 
 /**
  * @title Main
  * @notice Collects all mixins.
  */
 // solhint-disable max-states-count
-contract MainP0 is Initializable, Auth, ComponentRegistry, IMain {
-    using FixLib for uint192;
-
+contract MainP0 is Versioned, Initializable, Auth, ComponentRegistry, IMain {
     IERC20 public rsr;
 
     /// Initializer
@@ -36,9 +34,7 @@ contract MainP0 is Initializable, Auth, ComponentRegistry, IMain {
 
     /// @custom:refresher
     function poke() external {
-        require(!pausedOrFrozen(), "paused or frozen");
-        assetRegistry.refresh();
-        furnace.melt();
+        assetRegistry.refresh(); // runs furnace.melt()
         stRSR.payoutRewards();
         // NOT basketHandler.refreshBasket
     }

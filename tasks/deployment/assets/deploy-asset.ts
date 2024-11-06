@@ -3,39 +3,30 @@ import { task, types } from 'hardhat/config'
 import { Asset } from '../../../typechain'
 
 task('deploy-asset', 'Deploys an Asset')
+  .addParam('priceTimeout', 'The amount of time before a price decays to 0')
   .addParam('priceFeed', 'Price Feed address')
+  .addParam('oracleError', 'The % error in the price feed as a fix')
   .addParam('tokenAddress', 'ERC20 token address')
-  .addParam('rewardToken', 'Reward token address')
-  .addParam('tradingValMin', 'Trade Range - Min in UoA')
-  .addParam('tradingValMax', 'Trade Range - Max in UoA')
-  .addParam('tradingAmtMin', 'Trade Range - Min in whole toks')
-  .addParam('tradingAmtMax', 'Trade Range - Max in whole toks')
+  .addParam('maxTradeVolume', 'Max Trade Volume (in UoA)')
   .addParam('oracleTimeout', 'Max Oracle Timeout')
-  .addParam('oracleLib', 'Oracle library address')
   .addOptionalParam('noOutput', 'Suppress output', false, types.boolean)
   .setAction(async (params, hre) => {
     const [deployer] = await hre.ethers.getSigners()
 
     const chainId = await getChainId(hre)
 
-    const asset = <Asset>await (
-      await hre.ethers.getContractFactory('Asset', {
-        libraries: { OracleLib: params.oracleLib },
-      })
+    const asset = <Asset>(
+      await (await hre.ethers.getContractFactory('Asset'))
+        .connect(deployer)
+        .deploy(
+          params.priceTimeout,
+          params.priceFeed,
+          params.oracleError,
+          params.tokenAddress,
+          params.maxTradeVolume,
+          params.oracleTimeout
+        )
     )
-      .connect(deployer)
-      .deploy(
-        params.priceFeed,
-        params.tokenAddress,
-        params.rewardToken,
-        {
-          minVal: params.tradingValMin,
-          maxVal: params.tradingValMax,
-          minAmt: params.tradingAmtMin,
-          maxAmt: params.tradingAmtMax,
-        },
-        params.oracleTimeout
-      )
     await asset.deployed()
 
     if (!params.noOutput) {

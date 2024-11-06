@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
-import "contracts/p1/BackingManager.sol";
+import "../../../p1/BackingManager.sol";
 
 /// @custom:oz-upgrades-unsafe-allow external-library-linking
 contract BackingManagerP1V2 is BackingManagerP1 {
@@ -11,7 +11,7 @@ contract BackingManagerP1V2 is BackingManagerP1 {
         newValue = newValue_;
     }
 
-    function version() external pure returns (string memory) {
-        return "V2";
+    function version() public pure override(Versioned, IVersioned) returns (string memory) {
+        return "2.0.0";
     }
 }

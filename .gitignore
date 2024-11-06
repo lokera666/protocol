@@ -10,8 +10,9 @@ flatten/
 node_modules/
 reports
 typechain/
+scripts/addresses/31337*
 
-.openzeppelin
+.openzeppelin/unknown-*.json
 .env
 .vscode/
 /local/
@@ -27,5 +28,18 @@ typechain/
 .\#*
 
 *.orig
-
 .idea
+
+# Scripts for local/test interactions
+scripts/test.ts
+scripts/playground.ts
+
+# Serialized proposals
+tasks/validation/proposals/proposal-*.json
+
+# tenderly deployment/verification artifacts
+deployments/
+backtests/
+
+# output files
+output.log

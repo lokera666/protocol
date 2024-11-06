@@ -1,7 +1,8 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
 import { ContractFactory, Wallet } from 'ethers'
-import { ethers, upgrades, waffle } from 'hardhat'
+import { ethers, upgrades } from 'hardhat'
 import { IComponents, IConfig } from '../common/configuration'
 import { OWNER, SHORT_FREEZER, LONG_FREEZER, PAUSER } from '../common/constants'
 import { bn } from '../common/numbers'
@@ -13,28 +14,29 @@ import {
   BackingManagerP1V2,
   BasketHandlerP1,
   BasketHandlerP1V2,
+  BasketLibP1,
   BrokerP1,
   BrokerP1V2,
   DistributorP1,
   DistributorP1V2,
+  DutchTrade,
   ERC20Mock,
   FurnaceP1,
   FurnaceP1V2,
   GnosisMock,
   GnosisTrade,
   IAssetRegistry,
-  IBasketHandler,
   MainP1,
   MainP1V2,
   RevenueTraderP1,
   RevenueTraderP1V2,
-  RewardableLibP1,
   RTokenAsset,
   RTokenP1,
   RTokenP1V2,
   StRSRP1Votes,
   StRSRP1VotesV2,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIBroker,
   TestIDistributor,
   TestIFurnace,
@@ -42,11 +44,9 @@ import {
   TestIRevenueTrader,
   TestIRToken,
   TestIStRSR,
-  TradingLibP1,
+  RecollateralizationLibP1,
 } from '../typechain'
 import { defaultFixture, Implementation, IMPLEMENTATION } from './fixtures'
-
-const createFixtureLoader = waffle.createFixtureLoader
 
 const describeP1 = IMPLEMENTATION == Implementation.P1 ? describe : describe.skip
 
@@ -72,12 +72,12 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
   let main: TestIMain
   let assetRegistry: IAssetRegistry
   let backingManager: TestIBackingManager
-  let basketHandler: IBasketHandler
+  let basketHandler: TestIBasketHandler
   let distributor: TestIDistributor
   let rsrTrader: TestIRevenueTrader
   let rTokenTrader: TestIRevenueTrader
-  let tradingLib: TradingLibP1
-  let rewardableLib: RewardableLibP1
+  let tradingLib: RecollateralizationLibP1
+  let basketLib: BasketLibP1
 
   // Factories
   let MainFactory: ContractFactory
@@ -89,15 +89,14 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
   let BasketHandlerFactory: ContractFactory
   let DistributorFactory: ContractFactory
   let BrokerFactory: ContractFactory
-  let TradeFactory: ContractFactory
+  let GnosisTradeFactory: ContractFactory
+  let DutchTradeFactory: ContractFactory
   let StRSRFactory: ContractFactory
 
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
+  let notWallet: Wallet
 
   before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
+    ;[, notWallet] = (await ethers.getSigners()) as unknown as Wallet[]
   })
 
   beforeEach(async () => {
@@ -124,31 +123,33 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     } = await loadFixture(defaultFixture))
 
     // Deploy TradingLib external library
-    const TradingLibFactory: ContractFactory = await ethers.getContractFactory('TradingLibP1')
-    tradingLib = <TradingLibP1>await TradingLibFactory.deploy()
+    const TradingLibFactory: ContractFactory = await ethers.getContractFactory(
+      'RecollateralizationLibP1'
+    )
+    tradingLib = <RecollateralizationLibP1>await TradingLibFactory.deploy()
 
-    // Deploy RewardableLib external library
-    const RewardableLibFactory: ContractFactory = await ethers.getContractFactory('RewardableLibP1')
-    rewardableLib = <RewardableLibP1>await RewardableLibFactory.deploy()
+    // Deploy BasketLib external library
+    const BasketLibFactory: ContractFactory = await ethers.getContractFactory('BasketLibP1')
+    basketLib = <BasketLibP1>await BasketLibFactory.deploy()
 
     // Setup factories
     MainFactory = await ethers.getContractFactory('MainP1')
-    RTokenFactory = await ethers.getContractFactory('RTokenP1', {
-      libraries: { RewardableLibP1: rewardableLib.address },
-    })
+    RTokenFactory = await ethers.getContractFactory('RTokenP1')
     FurnaceFactory = await ethers.getContractFactory('FurnaceP1')
-    RevenueTraderFactory = await ethers.getContractFactory('RevenueTraderP1', {
-      libraries: { RewardableLibP1: rewardableLib.address, TradingLibP1: tradingLib.address },
-    })
+    RevenueTraderFactory = await ethers.getContractFactory('RevenueTraderP1')
     BackingManagerFactory = await ethers.getContractFactory('BackingManagerP1', {
-      libraries: { RewardableLibP1: rewardableLib.address, TradingLibP1: tradingLib.address },
+      libraries: {
+        RecollateralizationLibP1: tradingLib.address,
+      },
     })
     AssetRegistryFactory = await ethers.getContractFactory('AssetRegistryP1')
-
-    BasketHandlerFactory = await ethers.getContractFactory('BasketHandlerP1')
+    BasketHandlerFactory = await ethers.getContractFactory('BasketHandlerP1', {
+      libraries: { BasketLibP1: basketLib.address },
+    })
     DistributorFactory = await ethers.getContractFactory('DistributorP1')
     BrokerFactory = await ethers.getContractFactory('BrokerP1')
-    TradeFactory = await ethers.getContractFactory('GnosisTrade')
+    GnosisTradeFactory = await ethers.getContractFactory('GnosisTrade')
+    DutchTradeFactory = await ethers.getContractFactory('DutchTrade')
     StRSRFactory = await ethers.getContractFactory('StRSRP1Votes')
 
     // Import deployed proxies
@@ -223,7 +224,13 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should deploy valid implementation - BackingManager', async () => {
       const newBackingMgr: BackingManagerP1 = <BackingManagerP1>await upgrades.deployProxy(
         BackingManagerFactory,
-        [main.address, config.tradingDelay, config.backingBuffer, config.maxTradeSlippage],
+        [
+          main.address,
+          config.tradingDelay,
+          config.backingBuffer,
+          config.maxTradeSlippage,
+          config.minTradeVolume,
+        ],
         {
           initializer: 'init',
           kind: 'uups',
@@ -241,10 +248,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should deploy valid implementation - BasketHandler', async () => {
       const newBasketHandler: BasketHandlerP1 = <BasketHandlerP1>await upgrades.deployProxy(
         BasketHandlerFactory,
-        [main.address],
+        [main.address, config.warmupPeriod, config.reweightable],
         {
           initializer: 'init',
           kind: 'uups',
+          unsafeAllow: ['external-library-linking'],
         }
       )
       await newBasketHandler.deployed()
@@ -253,11 +261,19 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     })
 
     it('Should deploy valid implementation - Broker / Trade', async () => {
-      const trade: GnosisTrade = <GnosisTrade>await TradeFactory.deploy()
+      const gnosisTrade: GnosisTrade = <GnosisTrade>await GnosisTradeFactory.deploy()
+      const dutchTrade: DutchTrade = <DutchTrade>await DutchTradeFactory.deploy()
 
       const newBroker: BrokerP1 = <BrokerP1>await upgrades.deployProxy(
         BrokerFactory,
-        [main.address, gnosis.address, trade.address, config.auctionLength],
+        [
+          main.address,
+          gnosis.address,
+          gnosisTrade.address,
+          config.batchAuctionLength,
+          dutchTrade.address,
+          config.dutchAuctionLength,
+        ],
         {
           initializer: 'init',
           kind: 'uups',
@@ -266,8 +282,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       await newBroker.deployed()
 
       expect(await newBroker.gnosis()).to.equal(gnosis.address)
-      expect(await newBroker.auctionLength()).to.equal(config.auctionLength)
-      expect(await newBroker.disabled()).to.equal(false)
+      expect(await newBroker.batchAuctionLength()).to.equal(config.batchAuctionLength)
+      expect(await newBroker.dutchAuctionLength()).to.equal(config.dutchAuctionLength)
+      expect(await newBroker.batchTradeDisabled()).to.equal(false)
+      expect(await newBroker.dutchTradeDisabled(rToken.address)).to.equal(false)
+      expect(await newBroker.dutchTradeDisabled(rsr.address)).to.equal(false)
       expect(await newBroker.main()).to.equal(main.address)
     })
 
@@ -291,7 +310,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should deploy valid implementation - Furnace', async () => {
       const newFurnace: FurnaceP1 = <FurnaceP1>await upgrades.deployProxy(
         FurnaceFactory,
-        [main.address, config.rewardPeriod, config.rewardRatio],
+        [main.address, config.rewardRatio],
         {
           initializer: 'init',
           kind: 'uups',
@@ -299,7 +318,6 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       )
       await newFurnace.deployed()
 
-      expect(await newFurnace.period()).to.equal(config.rewardPeriod)
       expect(await newFurnace.ratio()).to.equal(config.rewardRatio)
       expect(await newFurnace.lastPayout()).to.be.gt(0)
       expect(await newFurnace.main()).to.equal(main.address)
@@ -308,11 +326,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should deploy valid implementation - RevenueTrader', async () => {
       const newRevenueTrader: RevenueTraderP1 = <RevenueTraderP1>await upgrades.deployProxy(
         RevenueTraderFactory,
-        [main.address, rsr.address, config.maxTradeSlippage],
+        [main.address, rsr.address, config.maxTradeSlippage, config.minTradeVolume],
         {
           initializer: 'init',
           kind: 'uups',
-          unsafeAllow: ['external-library-linking', 'delegatecall'], // TradingLib
+          unsafeAllow: ['delegatecall'], // Multicall
         }
       )
       await newRevenueTrader.deployed()
@@ -330,14 +348,12 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
           'RTKN RToken',
           'RTKN',
           'Manifesto',
-          config.issuanceRate,
-          config.maxRedemptionCharge,
-          config.redemptionVirtualSupply,
+          config.issuanceThrottle,
+          config.redemptionThrottle,
         ],
         {
           initializer: 'init',
           kind: 'uups',
-          unsafeAllow: ['external-library-linking'],
         }
       )
       await newRToken.deployed()
@@ -346,7 +362,6 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await newRToken.symbol()).to.equal('RTKN')
       expect(await newRToken.decimals()).to.equal(18)
       expect(await newRToken.totalSupply()).to.equal(bn(0))
-      expect(await newRToken.issuanceRate()).to.equal(config.issuanceRate)
       expect(await newRToken.main()).to.equal(main.address)
     })
 
@@ -358,8 +373,8 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
           'rtknRSR Token',
           'rtknRSR',
           config.unstakingDelay,
-          config.rewardPeriod,
           config.rewardRatio,
+          config.withdrawalLeak,
         ],
         {
           initializer: 'init',
@@ -373,13 +388,29 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await newStRSR.decimals()).to.equal(18)
       expect(await newStRSR.totalSupply()).to.equal(0)
       expect(await newStRSR.unstakingDelay()).to.equal(config.unstakingDelay)
-      expect(await newStRSR.rewardPeriod()).to.equal(config.rewardPeriod)
       expect(await newStRSR.rewardRatio()).to.equal(config.rewardRatio)
       expect(await newStRSR.main()).to.equal(main.address)
     })
   })
 
   describe('Upgrades', () => {
+    it('Should only allow OWNER to upgrade - Main', async () => {
+      const MainV2Factory: ContractFactory = await ethers.getContractFactory('MainP1V2', notWallet)
+      await expect(upgrades.upgradeProxy(main.address, MainV2Factory)).revertedWith(
+        `AccessControl: account ${notWallet.address.toLowerCase()} is missing role 0x4f574e4552000000000000000000000000000000000000000000000000000000`
+      )
+    })
+
+    it('Should only allow governance to upgrade - Component', async () => {
+      const AssetRegV2Factory: ContractFactory = await ethers.getContractFactory(
+        'AssetRegistryP1V2',
+        notWallet
+      )
+      await expect(upgrades.upgradeProxy(assetRegistry.address, AssetRegV2Factory)).revertedWith(
+        'governance only'
+      )
+    })
+
     it('Should upgrade correctly - Main', async () => {
       // Upgrading
       const MainV2Factory: ContractFactory = await ethers.getContractFactory('MainP1V2')
@@ -389,9 +420,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(mainV2.address).to.equal(main.address)
 
       // Check state is preserved
-      expect(await mainV2.paused()).to.equal(false)
+      expect(await mainV2.tradingPaused()).to.equal(false)
+      expect(await mainV2.issuancePaused()).to.equal(false)
       expect(await mainV2.frozen()).to.equal(false)
-      expect(await mainV2.pausedOrFrozen()).to.equal(false)
+      expect(await mainV2.tradingPausedOrFrozen()).to.equal(false)
+      expect(await mainV2.issuancePausedOrFrozen()).to.equal(false)
       expect(await mainV2.hasRole(OWNER, owner.address)).to.equal(true)
       expect(await mainV2.hasRole(OWNER, main.address)).to.equal(false)
       expect(await mainV2.hasRole(SHORT_FREEZER, owner.address)).to.equal(true)
@@ -414,7 +447,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await mainV2.rTokenTrader()).to.equal(rTokenTrader.address)
 
       // Check new version is implemented
-      expect(await mainV2.version()).to.equal('V2')
+      expect(await mainV2.version()).to.equal('2.0.0')
 
       expect(await mainV2.newValue()).to.equal(0)
       await mainV2.connect(owner).setNewValue(bn(1000))
@@ -439,7 +472,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await assetRegV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await assetRegV2.version()).to.equal('V2')
+      expect(await assetRegV2.version()).to.equal('2.0.0')
 
       expect(await assetRegV2.newValue()).to.equal(0)
       await assetRegV2.connect(owner).setNewValue(bn(1000))
@@ -450,7 +483,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       // Upgrading
       const BackingMgrV2Factory: ContractFactory = await ethers.getContractFactory(
         'BackingManagerP1V2',
-        { libraries: { RewardableLibP1: rewardableLib.address, TradingLibP1: tradingLib.address } }
+        {
+          libraries: {
+            RecollateralizationLibP1: tradingLib.address,
+          },
+        }
       )
       const backingMgrV2: BackingManagerP1V2 = <BackingManagerP1V2>await upgrades.upgradeProxy(
         backingManager.address,
@@ -470,7 +507,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await backingMgrV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await backingMgrV2.version()).to.equal('V2')
+      expect(await backingMgrV2.version()).to.equal('2.0.0')
 
       expect(await backingMgrV2.newValue()).to.equal(0)
       await backingMgrV2.connect(owner).setNewValue(bn(1000))
@@ -480,10 +517,15 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should upgrade correctly - BasketHandler', async () => {
       // Upgrading
       const BasketHandlerV2Factory: ContractFactory = await ethers.getContractFactory(
-        'BasketHandlerP1V2'
+        'BasketHandlerP1V2',
+        { libraries: { BasketLibP1: basketLib.address } }
       )
-      const bskHndlrV2: BasketHandlerP1V2 = <BasketHandlerP1V2>(
-        await upgrades.upgradeProxy(basketHandler.address, BasketHandlerV2Factory)
+      const bskHndlrV2: BasketHandlerP1V2 = <BasketHandlerP1V2>await upgrades.upgradeProxy(
+        basketHandler.address,
+        BasketHandlerV2Factory,
+        {
+          unsafeAllow: ['external-library-linking'], // BasketLibP1
+        }
       )
 
       // Check address is maintained
@@ -493,7 +535,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await bskHndlrV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await bskHndlrV2.version()).to.equal('V2')
+      expect(await bskHndlrV2.version()).to.equal('2.0.0')
 
       expect(await bskHndlrV2.newValue()).to.equal(0)
       await bskHndlrV2.connect(owner).setNewValue(bn(1000))
@@ -512,12 +554,14 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
 
       // Check state is preserved
       expect(await brokerV2.gnosis()).to.equal(gnosis.address)
-      expect(await brokerV2.auctionLength()).to.equal(config.auctionLength)
-      expect(await brokerV2.disabled()).to.equal(false)
+      expect(await brokerV2.batchAuctionLength()).to.equal(config.batchAuctionLength)
+      expect(await brokerV2.batchTradeDisabled()).to.equal(false)
+      expect(await brokerV2.dutchTradeDisabled(rToken.address)).to.equal(false)
+      expect(await brokerV2.dutchTradeDisabled(rsr.address)).to.equal(false)
       expect(await brokerV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await brokerV2.version()).to.equal('V2')
+      expect(await brokerV2.version()).to.equal('2.0.0')
 
       expect(await brokerV2.newValue()).to.equal(0)
       await brokerV2.connect(owner).setNewValue(bn(1000))
@@ -543,7 +587,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await distributorV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await distributorV2.version()).to.equal('V2')
+      expect(await distributorV2.version()).to.equal('2.0.0')
 
       expect(await distributorV2.newValue()).to.equal(0)
       await distributorV2.connect(owner).setNewValue(bn(1000))
@@ -561,13 +605,12 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(furnaceV2.address).to.equal(furnace.address)
 
       // Check state is preserved
-      expect(await furnaceV2.period()).to.equal(config.rewardPeriod)
       expect(await furnaceV2.ratio()).to.equal(config.rewardRatio)
       expect(await furnaceV2.lastPayout()).to.be.gt(0) // A timestamp is set
       expect(await furnaceV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await furnaceV2.version()).to.equal('V2')
+      expect(await furnaceV2.version()).to.equal('2.0.0')
 
       expect(await furnaceV2.newValue()).to.equal(0)
       await furnaceV2.connect(owner).setNewValue(bn(1000))
@@ -577,14 +620,13 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
     it('Should upgrade correctly - RevenueTrader', async () => {
       // Upgrading
       const RevTraderV2Factory: ContractFactory = await ethers.getContractFactory(
-        'RevenueTraderP1V2',
-        { libraries: { RewardableLibP1: rewardableLib.address, TradingLibP1: tradingLib.address } }
+        'RevenueTraderP1V2'
       )
       const rsrTraderV2: RevenueTraderP1V2 = <RevenueTraderP1V2>await upgrades.upgradeProxy(
         rsrTrader.address,
         RevTraderV2Factory,
         {
-          unsafeAllow: ['external-library-linking', 'delegatecall'], // TradingLib
+          unsafeAllow: ['delegatecall'], // Multicall
         }
       )
 
@@ -592,7 +634,7 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
         rTokenTrader.address,
         RevTraderV2Factory,
         {
-          unsafeAllow: ['external-library-linking', 'delegatecall'], // TradingLib
+          unsafeAllow: ['delegatecall'], // Multicall
         }
       )
 
@@ -610,8 +652,8 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await rTokenTraderV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await rsrTraderV2.version()).to.equal('V2')
-      expect(await rTokenTraderV2.version()).to.equal('V2')
+      expect(await rsrTraderV2.version()).to.equal('2.0.0')
+      expect(await rTokenTraderV2.version()).to.equal('2.0.0')
 
       expect(await rsrTraderV2.newValue()).to.equal(0)
       await rsrTraderV2.connect(owner).setNewValue(bn(1000))
@@ -624,15 +666,9 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
 
     it('Should upgrade correctly - RToken', async () => {
       // Upgrading
-      const RTokenV2Factory: ContractFactory = await ethers.getContractFactory('RTokenP1V2', {
-        libraries: { RewardableLibP1: rewardableLib.address },
-      })
-      const rTokenV2: RTokenP1V2 = <RTokenP1V2>await upgrades.upgradeProxy(
-        rToken.address,
-        RTokenV2Factory,
-        {
-          unsafeAllow: ['external-library-linking'],
-        }
+      const RTokenV2Factory: ContractFactory = await ethers.getContractFactory('RTokenP1V2')
+      const rTokenV2: RTokenP1V2 = <RTokenP1V2>(
+        await upgrades.upgradeProxy(rToken.address, RTokenV2Factory)
       )
 
       // Check address is maintained
@@ -643,11 +679,16 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await rTokenV2.symbol()).to.equal('RTKN')
       expect(await rTokenV2.decimals()).to.equal(18)
       expect(await rTokenV2.totalSupply()).to.equal(bn(0))
-      expect(await rTokenV2.issuanceRate()).to.equal(config.issuanceRate)
       expect(await rTokenV2.main()).to.equal(main.address)
+      const issThrottle = await rToken.issuanceThrottleParams()
+      expect(issThrottle.amtRate).to.equal(config.issuanceThrottle.amtRate)
+      expect(issThrottle.pctRate).to.equal(config.issuanceThrottle.pctRate)
+      const redemptionThrottle = await rToken.redemptionThrottleParams()
+      expect(redemptionThrottle.amtRate).to.equal(config.redemptionThrottle.amtRate)
+      expect(redemptionThrottle.pctRate).to.equal(config.redemptionThrottle.pctRate)
 
       // Check new version is implemented
-      expect(await rTokenV2.version()).to.equal('V2')
+      expect(await rTokenV2.version()).to.equal('2.0.0')
 
       expect(await rTokenV2.newValue()).to.equal(0)
       await rTokenV2.connect(owner).setNewValue(bn(1000))
@@ -670,12 +711,11 @@ describeP1(`Upgradeability - P${IMPLEMENTATION}`, () => {
       expect(await stRSRV2.decimals()).to.equal(18)
       expect(await stRSRV2.totalSupply()).to.equal(0)
       expect(await stRSRV2.unstakingDelay()).to.equal(config.unstakingDelay)
-      expect(await stRSRV2.rewardPeriod()).to.equal(config.rewardPeriod)
       expect(await stRSRV2.rewardRatio()).to.equal(config.rewardRatio)
       expect(await stRSRV2.main()).to.equal(main.address)
 
       // Check new version is implemented
-      expect(await stRSRV2.version()).to.equal('V2')
+      expect(await stRSRV2.version()).to.equal('2.0.0')
 
       expect(await stRSRV2.newValue()).to.equal(0)
       await stRSRV2.connect(owner).setNewValue(bn(1000))

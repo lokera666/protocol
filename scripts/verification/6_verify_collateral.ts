@@ -1,15 +1,25 @@
 import hre, { ethers } from 'hardhat'
-
 import { getChainId } from '../../common/blockchain-utils'
-import { developmentChains, networkConfig } from '../../common/configuration'
-import { ZERO_ADDRESS } from '../../common/constants'
+import {
+  arbitrumL2Chains,
+  baseL2Chains,
+  developmentChains,
+  networkConfig,
+} from '../../common/configuration'
 import { fp, bn } from '../../common/numbers'
 import {
   getDeploymentFile,
   getAssetCollDeploymentFilename,
   IAssetCollDeployments,
 } from '../deployment/common'
-import { getOracleTimeout, verifyContract } from '../deployment/utils'
+import {
+  combinedError,
+  getDaiOracleError,
+  getDaiOracleTimeout,
+  priceTimeout,
+  revenueHiding,
+  verifyContract,
+} from '../deployment/utils'
 import { ATokenMock, ATokenFiatCollateral } from '../../typechain'
 
 let deployments: IAssetCollDeployments
@@ -29,198 +39,206 @@ async function main() {
   deployments = <IAssetCollDeployments>getDeploymentFile(assetCollDeploymentFilename)
 
   /********  Verify Fiat Collateral - DAI  **************************/
+  const daiOracleTimeout = getDaiOracleTimeout(hre.network.name)
+  const daiOracleError = getDaiOracleError(hre.network.name)
+
   await verifyContract(
     chainId,
     deployments.collateral.DAI,
     [
-      networkConfig[chainId].chainlinkFeeds.DAI,
-      networkConfig[chainId].tokens.DAI,
-      ZERO_ADDRESS,
       {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '1e3' : '1').toString(), // 1k DAI
-        maxAmt: fp(chainId == 1 ? '1e6' : '1e9').toString(), // 1M DAI
+        priceTimeout: priceTimeout.toString(),
+        chainlinkFeed: networkConfig[chainId].chainlinkFeeds.DAI,
+        oracleError: daiOracleError.toString(),
+        erc20: networkConfig[chainId].tokens.DAI,
+        maxTradeVolume: fp('1e6').toString(), // $1m,
+        oracleTimeout: daiOracleTimeout,
+        targetName: hre.ethers.utils.formatBytes32String('USD'),
+        defaultThreshold: fp('0.01').add(daiOracleError).toString(),
+        delayUntilDefault: bn('86400').toString(), // 24h
       },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('USD'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
     ],
     'contracts/plugins/assets/FiatCollateral.sol:FiatCollateral'
   )
-  /********  Verify StaticATokenLM - aDAI  **************************/
-  // Get AToken to retrieve name and symbol
-  const aToken: ATokenMock = <ATokenMock>(
-    await ethers.getContractAt('ATokenMock', networkConfig[chainId].tokens.aDAI as string)
-  )
-  const aTokenCollateral: ATokenFiatCollateral = <ATokenFiatCollateral>(
-    await ethers.getContractAt('ATokenFiatCollateral', deployments.collateral.aDAI as string)
-  )
 
-  await verifyContract(
-    chainId,
-    await aTokenCollateral.erc20(),
-    [
-      networkConfig[chainId].AAVE_LENDING_POOL as string,
-      aToken.address,
-      'Static ' + (await aToken.name()),
-      'stat' + (await aToken.symbol()),
-    ],
-    'contracts/plugins/aave/StaticATokenLM.sol:StaticATokenLM'
-  )
-  /********  Verify ATokenFiatCollateral - aDAI  **************************/
-  await verifyContract(
-    chainId,
-    aTokenCollateral.address,
-    [
-      networkConfig[chainId].chainlinkFeeds.DAI,
+  /********  Verify Fiat Collateral - USDbC  **************************/
+  const usdcOracleTimeout = 86400 // 24 hr
+  const usdcOracleError = baseL2Chains.includes(hre.network.name) ? fp('0.003') : fp('0.0025') // 0.3% (Base) or 0.25%
+
+  if (baseL2Chains.includes(hre.network.name)) {
+    await verifyContract(
+      chainId,
+      deployments.collateral.USDC,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.USDC,
+          oracleError: usdcOracleError.toString(),
+          erc20: networkConfig[chainId].tokens.USDC,
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: usdcOracleTimeout,
+          targetName: hre.ethers.utils.formatBytes32String('USD'),
+          defaultThreshold: fp('0.01').add(usdcOracleError).toString(),
+          delayUntilDefault: bn('86400').toString(), // 24h
+        },
+      ],
+      'contracts/plugins/assets/FiatCollateral.sol:FiatCollateral'
+    )
+  }
+
+  if (!arbitrumL2Chains.includes(hre.network.name) && !baseL2Chains.includes(hre.network.name)) {
+    /********  Verify StaticATokenLM - aDAI  **************************/
+    // Get AToken to retrieve name and symbol
+    const aToken: ATokenMock = <ATokenMock>(
+      await ethers.getContractAt('ATokenMock', networkConfig[chainId].tokens.aDAI as string)
+    )
+    const aTokenCollateral: ATokenFiatCollateral = <ATokenFiatCollateral>(
+      await ethers.getContractAt('ATokenFiatCollateral', deployments.collateral.aDAI as string)
+    )
+
+    await verifyContract(
+      chainId,
       await aTokenCollateral.erc20(),
-      networkConfig[chainId].tokens.stkAAVE,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '1e3' : '1').toString(), // 1k DAI
-        maxAmt: fp(chainId == 1 ? '1e6' : '1e9').toString(), // 1M DAI
-      },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('USD'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
-    ],
-    'contracts/plugins/assets/ATokenFiatCollateral.sol:ATokenFiatCollateral'
-  )
-  /********************** Verify CTokenFiatCollateral - cDAI  ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.collateral.cDAI,
-    [
-      networkConfig[chainId].chainlinkFeeds.DAI,
-      networkConfig[chainId].tokens.cDAI,
-      networkConfig[chainId].tokens.COMP,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '50e3' : '1').toString(), // 50k cDAI
-        maxAmt: fp(chainId == 1 ? '50e6' : '1e9').toString(), // 50M cDAI
-      },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('USD'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
-      bn(18).toString(),
-      networkConfig[chainId].COMPTROLLER,
-    ],
-    'contracts/plugins/assets/CTokenFiatCollateral.sol:CTokenFiatCollateral'
-  )
-  /********************** Verify CTokenNonFiatCollateral - cWBTC  ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.collateral.cWBTC,
-    [
-      networkConfig[chainId].chainlinkFeeds.WBTC,
-      networkConfig[chainId].chainlinkFeeds.BTC,
-      networkConfig[chainId].tokens.cWBTC,
-      networkConfig[chainId].tokens.COMP,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '12.5' : '1').toString(), // 12.5 cWBTC or 0.25 BTC
-        maxAmt: fp(chainId == 1 ? '12500' : '1e9').toString(), // 12500 cWBTC or 250 BTC
-      },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('BTC'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
-      bn(8).toString(),
-      networkConfig[chainId].COMPTROLLER,
-    ],
-    'contracts/plugins/assets/CTokenNonFiatCollateral.sol:CTokenNonFiatCollateral'
-  )
-  /********************** Verify CTokenSelfReferentialFiatCollateral - cETH  ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.collateral.cETH,
-    [
-      networkConfig[chainId].chainlinkFeeds.ETH,
-      networkConfig[chainId].tokens.cETH,
-      networkConfig[chainId].tokens.COMP,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '25' : '1').toString(), // 25 cETH or 0.5 ETH
-        maxAmt: fp(chainId == 1 ? '25e3' : '1e9').toString(), // 25,000 cETH or 500 ETH
-      },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('ETH'),
-      bn(18).toString(),
-      networkConfig[chainId].COMPTROLLER,
-    ],
-    'contracts/plugins/assets/CTokenSelfReferentialCollateral.sol:CTokenSelfReferentialCollateral'
-  )
-  /********************** Verify NonFiatCollateral - wBTC  ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.collateral.WBTC,
-    [
-      networkConfig[chainId].chainlinkFeeds.WBTC,
-      networkConfig[chainId].chainlinkFeeds.BTC,
-      networkConfig[chainId].tokens.WBTC,
-      ZERO_ADDRESS,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '0.25' : '1').toString(), // 0.25 BTC
-        maxAmt: fp(chainId == 1 ? '250' : '1e9').toString(), // 250 BTC
-      },
-      getOracleTimeout(chainId).toString(),
-      ethers.utils.formatBytes32String('BTC'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
-    ],
-    'contracts/plugins/assets/NonFiatCollateral.sol:NonFiatCollateral'
-  )
-  /********************** Verify SelfReferentialCollateral - cETH  ****************************************/
+      [
+        networkConfig[chainId].AAVE_LENDING_POOL as string,
+        aToken.address,
+        'Static ' + (await aToken.name()),
+        's' + (await aToken.symbol()),
+      ],
+      'contracts/plugins/assets/aave/StaticATokenLM.sol:StaticATokenLM'
+    )
+    /********  Verify ATokenFiatCollateral - aDAI  **************************/
+    await verifyContract(
+      chainId,
+      aTokenCollateral.address,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.DAI,
+          oracleError: fp('0.0025').toString(), // 0.25%
+          erc20: await aTokenCollateral.erc20(),
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: '3600', // 1 hr
+          targetName: hre.ethers.utils.formatBytes32String('USD'),
+          defaultThreshold: fp('0.0125').toString(), // 1.25%
+          delayUntilDefault: bn('86400').toString(), // 24h
+        },
+        revenueHiding.toString(),
+      ],
+      'contracts/plugins/assets/aave/ATokenFiatCollateral.sol:ATokenFiatCollateral'
+    )
+    /********************** Verify CTokenFiatCollateral - cDAI  ****************************************/
+    await verifyContract(
+      chainId,
+      deployments.collateral.cDAI,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.DAI,
+          oracleError: fp('0.0025').toString(), // 0.25%
+          erc20: deployments.erc20s.cDAI,
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: '3600', // 1 hr
+          targetName: hre.ethers.utils.formatBytes32String('USD'),
+          defaultThreshold: fp('0.0125').toString(), // 1.25%
+          delayUntilDefault: bn('86400').toString(), // 24h
+        },
+        revenueHiding.toString(),
+      ],
+      'contracts/plugins/assets/compoundv2/CTokenFiatCollateral.sol:CTokenFiatCollateral'
+    )
+    /********************** Verify CTokenNonFiatCollateral - cWBTC  ****************************************/
+
+    const wbtcOracleError = fp('0.02') // 2%
+    const btcOracleError = fp('0.005') // 0.5%
+    const combinedBTCWBTCError = combinedError(wbtcOracleError, btcOracleError)
+
+    await verifyContract(
+      chainId,
+      deployments.collateral.cWBTC,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.WBTC,
+          oracleError: combinedBTCWBTCError.toString(),
+          erc20: deployments.erc20s.cWBTC,
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: '86400', // 24 hr
+          targetName: hre.ethers.utils.formatBytes32String('BTC'),
+          defaultThreshold: fp('0.01').add(combinedBTCWBTCError).toString(), // ~3.5%
+          delayUntilDefault: bn('86400').toString(), // 24h
+        },
+        networkConfig[chainId].chainlinkFeeds.BTC,
+        '3600',
+        revenueHiding.toString(),
+      ],
+      'contracts/plugins/assets/compoundv2/CTokenNonFiatCollateral.sol:CTokenNonFiatCollateral'
+    )
+    /********************** Verify CTokenSelfReferentialFiatCollateral - cETH  ****************************************/
+    await verifyContract(
+      chainId,
+      deployments.collateral.cETH,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.ETH,
+          oracleError: fp('0.005').toString(), // 0.5%
+          erc20: deployments.erc20s.cETH,
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: '3600', // 1 hr
+          targetName: hre.ethers.utils.formatBytes32String('ETH'),
+          defaultThreshold: '0',
+          delayUntilDefault: '0',
+        },
+        revenueHiding.toString(),
+        '18',
+      ],
+      'contracts/plugins/assets/compoundv2/CTokenSelfReferentialCollateral.sol:CTokenSelfReferentialCollateral'
+    )
+    /********************** Verify NonFiatCollateral - wBTC  ****************************************/
+    await verifyContract(
+      chainId,
+      deployments.collateral.WBTC,
+      [
+        {
+          priceTimeout: priceTimeout.toString(),
+          chainlinkFeed: networkConfig[chainId].chainlinkFeeds.WBTC,
+          oracleError: combinedBTCWBTCError.toString(),
+          erc20: networkConfig[chainId].tokens.WBTC,
+          maxTradeVolume: fp('1e6').toString(), // $1m,
+          oracleTimeout: '86400', // 24h
+          targetName: ethers.utils.formatBytes32String('BTC'),
+          defaultThreshold: fp('0.01').add(combinedBTCWBTCError).toString(), // ~3.5%
+          delayUntilDefault: bn('86400').toString(), // 24h
+        },
+        networkConfig[chainId].chainlinkFeeds.BTC,
+        '3600',
+      ],
+      'contracts/plugins/assets/NonFiatCollateral.sol:NonFiatCollateral'
+    )
+  }
+
+  /********************** Verify SelfReferentialCollateral - WETH  ****************************************/
+  const ethOracleTimeout = baseL2Chains.includes(hre.network.name) ? 1200 : 3600 // 20 min (Base) or 1 hr
+  const ethOracleError = baseL2Chains.includes(hre.network.name) ? fp('0.0015') : fp('0.005') // 0.15% (Base) or 0.5%
+
   await verifyContract(
     chainId,
     deployments.collateral.WETH,
     [
-      networkConfig[chainId].chainlinkFeeds.ETH,
-      networkConfig[chainId].tokens.WETH,
-      ZERO_ADDRESS,
       {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '0.5' : '1').toString(), // 0.5 ETH
-        maxAmt: fp(chainId == 1 ? '500' : '1e9').toString(), // 500 ETH
+        priceTimeout: priceTimeout.toString(),
+        chainlinkFeed: networkConfig[chainId].chainlinkFeeds.ETH,
+        oracleError: ethOracleError.toString(), // 0.5%
+        erc20: networkConfig[chainId].tokens.WETH,
+        maxTradeVolume: fp('1e6').toString(), // $1m,
+        oracleTimeout: ethOracleTimeout,
+        targetName: hre.ethers.utils.formatBytes32String('ETH'),
+        defaultThreshold: '0',
+        delayUntilDefault: '0',
       },
-      getOracleTimeout(chainId).toString(),
-      hre.ethers.utils.formatBytes32String('ETH'),
     ],
     'contracts/plugins/assets/SelfReferentialCollateral.sol:SelfReferentialCollateral'
-  )
-
-  /********************** Verify EURFiatCollateral - EURT  ****************************************/
-  await verifyContract(
-    chainId,
-    deployments.collateral.EURT,
-    [
-      networkConfig[chainId].chainlinkFeeds.EURT,
-      networkConfig[chainId].chainlinkFeeds.EUR,
-      networkConfig[chainId].tokens.EURT,
-      ZERO_ADDRESS,
-      {
-        minVal: fp(chainId == 1 ? '1e4' : '0').toString(), // $10k,
-        maxVal: fp(chainId == 1 ? '1e6' : '0').toString(), // $1m,
-        minAmt: fp(chainId == 1 ? '1e3' : '1').toString(), // 1k EURO
-        maxAmt: fp(chainId == 1 ? '1e6' : '1e9').toString(), // 1M EURO
-      },
-      getOracleTimeout(chainId).toString(),
-      ethers.utils.formatBytes32String('EURO'),
-      fp('0.05').toString(), // 5%
-      bn('86400').toString(), // 24h
-    ],
-    'contracts/plugins/assets/EURFiatCollateral.sol:EURFiatCollateral'
   )
 }
 

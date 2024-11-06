@@ -1,20 +1,20 @@
+import { loadFixture } from '@nomicfoundation/hardhat-network-helpers'
 import { anyValue } from '@nomicfoundation/hardhat-chai-matchers/withArgs'
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers'
 import { expect } from 'chai'
-import { BigNumber, Wallet } from 'ethers'
-import { ethers, waffle } from 'hardhat'
+import { BigNumber } from 'ethers'
+import { ethers } from 'hardhat'
 import { IConfig } from '../../common/configuration'
-import { ZERO_ADDRESS } from '../../common/constants'
-import { bn, fp } from '../../common/numbers'
+import { TradeKind } from '../../common/constants'
+import { bn, divCeil, fp } from '../../common/numbers'
 import {
   BadERC20,
   ERC20Mock,
   IAssetRegistry,
-  IBasketHandler,
   MockV3Aggregator,
   RTokenAsset,
-  OracleLib,
   TestIBackingManager,
+  TestIBasketHandler,
   TestIFurnace,
   TestIStRSR,
   TestIRevenueTrader,
@@ -23,12 +23,17 @@ import {
 import { setOraclePrice } from '../utils/oracles'
 import { getTrade } from '../utils/trades'
 import { advanceTime } from '../utils/time'
-import { Collateral, defaultFixture, IMPLEMENTATION, ORACLE_TIMEOUT } from '../fixtures'
+import {
+  Collateral,
+  defaultFixtureNoBasket,
+  IMPLEMENTATION,
+  ORACLE_ERROR,
+  ORACLE_TIMEOUT,
+  PRICE_TIMEOUT,
+} from '../fixtures'
 
-const DEFAULT_THRESHOLD = fp('0.05') // 5%
+const DEFAULT_THRESHOLD = fp('0.01') // 1%
 const DELAY_UNTIL_DEFAULT = bn('86400') // 24h
-
-const createFixtureLoader = waffle.createFixtureLoader
 
 describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
   let owner: SignerWithAddress
@@ -58,16 +63,31 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
   let backingManager: TestIBackingManager
   let rTokenTrader: TestIRevenueTrader
   let rsrTrader: TestIRevenueTrader
-  let basketHandler: IBasketHandler
-  let oracleLib: OracleLib
+  let basketHandler: TestIBasketHandler
 
-  let loadFixture: ReturnType<typeof createFixtureLoader>
-  let wallet: Wallet
+  // Computes the minBuyAmt for a sellAmt at two prices
+  // sellPrice + buyPrice should not be the low and high estimates, but rather the oracle prices
+  const toMinBuyAmt = (
+    sellAmt: BigNumber,
+    sellPrice: BigNumber,
+    buyPrice: BigNumber,
+    oracleError: BigNumber,
+    maxTradeSlippage: BigNumber
+  ): BigNumber => {
+    // do all muls first so we don't round unnecessarily
+    // a = loss due to max trade slippage
+    // b = loss due to selling token at the low price
+    // c = loss due to buying token at the high price
+    // mirrors the math from TradeLib ~L:57
 
-  before('create fixture loader', async () => {
-    ;[wallet] = (await ethers.getSigners()) as unknown as Wallet[]
-    loadFixture = createFixtureLoader([wallet])
-  })
+    const lowSellPrice = sellPrice.sub(sellPrice.mul(oracleError).div(fp('1')))
+    const highBuyPrice = buyPrice.add(buyPrice.mul(oracleError).div(fp('1')))
+    const product = sellAmt
+      .mul(fp('1').sub(maxTradeSlippage)) // (a)
+      .mul(lowSellPrice) // (b)
+
+    return divCeil(divCeil(product, highBuyPrice), fp('1')) // (c)
+  }
 
   beforeEach(async () => {
     ;[owner, addr1, addr2] = await ethers.getSigners()
@@ -85,11 +105,10 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       assetRegistry,
       backingManager,
       basketHandler,
-      oracleLib,
       rTokenTrader,
       rsrTrader,
       rTokenAsset,
-    } = await loadFixture(defaultFixture))
+    } = await loadFixture(defaultFixtureNoBasket))
 
     // Main ERC20
     token0 = await (await ethers.getContractFactory('BadERC20')).deploy('Bad ERC20', 'BERC20')
@@ -97,19 +116,18 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await (await ethers.getContractFactory('MockV3Aggregator')).deploy(8, bn('1e8'))
     )
     collateral0 = await (
-      await ethers.getContractFactory('FiatCollateral', {
-        libraries: { OracleLib: oracleLib.address },
-      })
-    ).deploy(
-      chainlinkFeed.address,
-      token0.address,
-      ZERO_ADDRESS,
-      config.rTokenTradingRange,
-      ORACLE_TIMEOUT,
-      ethers.utils.formatBytes32String('USD'),
-      DEFAULT_THRESHOLD,
-      DELAY_UNTIL_DEFAULT
-    )
+      await ethers.getContractFactory('FiatCollateral')
+    ).deploy({
+      priceTimeout: PRICE_TIMEOUT,
+      chainlinkFeed: chainlinkFeed.address,
+      oracleError: ORACLE_ERROR,
+      erc20: token0.address,
+      maxTradeVolume: config.rTokenMaxTradeVolume,
+      oracleTimeout: ORACLE_TIMEOUT,
+      targetName: ethers.utils.formatBytes32String('USD'),
+      defaultThreshold: DEFAULT_THRESHOLD,
+      delayUntilDefault: DELAY_UNTIL_DEFAULT,
+    })
 
     // Backup
     backupToken = erc20s[2] // USDT
@@ -124,6 +142,7 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       backupToken.address,
     ])
     await basketHandler.refreshBasket()
+    await advanceTime(config.warmupPeriod.toNumber() + 1)
     await backingManager.grantRTokenAllowance(token0.address)
     await backingManager.grantRTokenAllowance(backupToken.address)
 
@@ -196,15 +215,16 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await advanceTime(DELAY_UNTIL_DEFAULT.toString())
       await expect(basketHandler.refreshBasket())
         .to.emit(basketHandler, 'BasketSet')
-        .withArgs([backupToken.address], [fp('1')], false)
-      await expect(backingManager.manageTokens([])).to.be.reverted // can't catch No Decimals
+        .withArgs(2, [backupToken.address], [fp('1')], false)
+      await advanceTime(config.warmupPeriod.toNumber() + 1)
+      await expect(backingManager.forwardRevenue([])).to.be.reverted // can't catch No Decimals
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.reverted // can't catch No Decimals
     })
 
     it('should keep collateral working', async () => {
       await collateral0.refresh()
       await collateral0.price()
       await collateral0.targetPerRef()
-      await collateral0.pricePerTarget()
       expect(await collateral0.status()).to.equal(0)
     })
 
@@ -218,7 +238,7 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
     })
 
     it('should still be able to claim rewards', async () => {
-      await rToken.connect(addr1).claimAndSweepRewards()
+      await backingManager.connect(addr1).claimRewards()
     })
 
     it('should still melt', async () => {
@@ -226,23 +246,26 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await furnace.melt()
     })
 
-    it('should be able to unregister and use RSR to recapitalize', async () => {
+    it('should be able to unregister and use RSR to recollateralize', async () => {
       await assetRegistry.connect(owner).unregister(collateral0.address)
       expect(await assetRegistry.isRegistered(collateral0.address)).to.equal(false)
       await expect(basketHandler.refreshBasket())
         .to.emit(basketHandler, 'BasketSet')
-        .withArgs([backupToken.address], [fp('1')], false)
-      await expect(backingManager.manageTokens([])).to.emit(backingManager, 'TradeStarted')
+        .withArgs(2, [backupToken.address], [fp('1')], false)
+
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.emit(
+        backingManager,
+        'TradeStarted'
+      )
 
       // Should be trading RSR for backup token
       const trade = await getTrade(backingManager, rsr.address)
       expect(await trade.status()).to.equal(1) // OPEN state
       expect(await trade.sell()).to.equal(rsr.address)
       expect(await trade.buy()).to.equal(backupToken.address)
-    })
-
-    it('should revert on RTokenAsset.price', async () => {
-      await expect(rTokenAsset.price()).to.be.revertedWith('No Decimals')
     })
   })
 
@@ -257,19 +280,16 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await token0.setCensored(rToken.address, true)
     })
 
-    it('should revert during atomic issuance', async () => {
-      await token0.connect(addr2).approve(rToken.address, issueAmt)
-      await expect(rToken.connect(addr2).issue(issueAmt)).to.be.revertedWith('censored')
+    it('should revert on issuance', async () => {
+      // Will revert even on approval
+      await expect(token0.connect(addr2).approve(rToken.address, issueAmt)).to.be.revertedWith(
+        'censored'
+      )
 
-      // Should work now
-      await token0.setCensored(backingManager.address, false)
+      // Allow approval temporarily
       await token0.setCensored(rToken.address, false)
-      await rToken.connect(addr2).issue(issueAmt)
-    })
-
-    it('should revert during slow issuance', async () => {
-      issueAmt = initialBal.div(10) // over 1 block
       await token0.connect(addr2).approve(rToken.address, issueAmt)
+      await token0.setCensored(rToken.address, true)
       await expect(rToken.connect(addr2).issue(issueAmt)).to.be.revertedWith('censored')
 
       // Should work now
@@ -293,19 +313,22 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await advanceTime(DELAY_UNTIL_DEFAULT.toString())
       await expect(basketHandler.refreshBasket())
         .to.emit(basketHandler, 'BasketSet')
-        .withArgs([backupToken.address], [fp('1')], false)
-      await expect(backingManager.manageTokens([])).to.be.revertedWith('censored')
+        .withArgs(2, [backupToken.address], [fp('1')], false)
+
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.be.revertedWith('censored')
 
       // Should work now
       await token0.setCensored(backingManager.address, false)
-      await backingManager.manageTokens([])
+      await backingManager.rebalance(TradeKind.BATCH_AUCTION)
     })
 
     it('should keep collateral working', async () => {
       await collateral0.refresh()
       await collateral0.price()
       await collateral0.targetPerRef()
-      await collateral0.pricePerTarget()
       expect(await collateral0.status()).to.equal(0)
     })
 
@@ -319,7 +342,7 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
     })
 
     it('should still be able to claim rewards', async () => {
-      await rToken.connect(addr1).claimAndSweepRewards()
+      await backingManager.connect(addr1).claimRewards()
     })
 
     it('should still have price', async () => {
@@ -331,13 +354,20 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
       await furnace.melt()
     })
 
-    it('should be able to unregister and use RSR to recapitalize', async () => {
+    it('should be able to unregister and use RSR to recollateralize', async () => {
       await assetRegistry.connect(owner).unregister(collateral0.address)
       expect(await assetRegistry.isRegistered(collateral0.address)).to.equal(false)
       await expect(basketHandler.refreshBasket())
         .to.emit(basketHandler, 'BasketSet')
-        .withArgs([backupToken.address], [fp('1')], false)
-      await expect(backingManager.manageTokens([])).to.emit(backingManager, 'TradeStarted')
+        .withArgs(2, [backupToken.address], [fp('1')], false)
+
+      // Advance time post warmup period - SOUND just regained
+      await advanceTime(Number(config.warmupPeriod) + 1)
+
+      await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION)).to.emit(
+        backingManager,
+        'TradeStarted'
+      )
 
       // Should be trading RSR for backup token
       const trade = await getTrade(backingManager, rsr.address)
@@ -349,18 +379,47 @@ describe(`Bad ERC20 - P${IMPLEMENTATION}`, () => {
     it('should be able to process any uncensored assets already accumulated at RevenueTraders', async () => {
       await rToken.connect(addr1).transfer(rTokenTrader.address, issueAmt.div(2))
       await rToken.connect(addr1).transfer(rsrTrader.address, issueAmt.div(2))
-      await expect(rTokenTrader.manageToken(rToken.address))
+      await expect(rTokenTrader.manageTokens([rToken.address], [TradeKind.BATCH_AUCTION]))
         .to.emit(rToken, 'Transfer')
         .withArgs(rTokenTrader.address, furnace.address, issueAmt.div(2))
-      await expect(rsrTrader.manageToken(rToken.address))
+      await expect(rsrTrader.manageTokens([rToken.address], [TradeKind.BATCH_AUCTION]))
         .to.emit(rsrTrader, 'TradeStarted')
-        .withArgs(
-          anyValue,
-          rToken.address,
-          rsr.address,
-          issueAmt.div(2),
-          issueAmt.div(2).mul(99).div(100)
+        .withArgs(anyValue, rToken.address, rsr.address, issueAmt.div(2), anyValue)
+    })
+  })
+
+  describe('with fussy approvals', function () {
+    let issueAmt: BigNumber
+
+    beforeEach(async () => {
+      issueAmt = initialBal.div(100)
+      await token0.connect(addr1).approve(rToken.address, issueAmt)
+      await token0.setRevertApprove(true)
+      await rToken.connect(addr1).issue(issueAmt)
+    })
+
+    context('Regression tests wcUSDCv3 10/10/2023', () => {
+      it('should not revert during recollateralization', async () => {
+        await basketHandler.setPrimeBasket(
+          [token0.address, backupToken.address],
+          [fp('0.5'), fp('0.5')]
         )
+        await basketHandler.refreshBasket()
+
+        // Should launch recollateralization auction successfully
+        await expect(backingManager.rebalance(TradeKind.BATCH_AUCTION))
+          .to.emit(backingManager, 'TradeStarted')
+          .withArgs(anyValue, token0.address, backupToken.address, anyValue, anyValue)
+      })
+
+      it('should not revert during revenue auction', async () => {
+        await token0.mint(rsrTrader.address, issueAmt)
+
+        // Should launch revenue auction successfully
+        await expect(rsrTrader.manageTokens([token0.address], [TradeKind.BATCH_AUCTION]))
+          .to.emit(rsrTrader, 'TradeStarted')
+          .withArgs(anyValue, token0.address, rsr.address, anyValue, anyValue)
+      })
     })
   })
 })

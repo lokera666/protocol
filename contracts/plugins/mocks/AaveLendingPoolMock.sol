@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 // See: https://github.com/aave/protocol-v2/tree/master/contracts/interfaces
 interface IAaveLendingPool {
@@ -33,7 +33,7 @@ contract AaveLendingPoolMock is IAaveLendingPool {
     }
 
     function getReserveNormalizedIncome(address asset) external view returns (uint256) {
-        return _normalizedIncome[asset] > 0 ? _normalizedIncome[asset] : 1e27;
+        return _normalizedIncome[asset] != 0 ? _normalizedIncome[asset] : 1e27;
     }
 
     function setNormalizedIncome(address asset, uint256 newRate) external {

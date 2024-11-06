@@ -1,53 +1,51 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-pragma solidity 0.8.9;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "contracts/plugins/assets/Asset.sol";
-import "contracts/plugins/assets/RTokenAsset.sol";
-import "contracts/facade/Facade.sol";
-import "contracts/p0/AssetRegistry.sol";
-import "contracts/p0/BackingManager.sol";
-import "contracts/p0/BasketHandler.sol";
-import "contracts/p0/Broker.sol";
-import "contracts/p0/Distributor.sol";
-import "contracts/p0/Furnace.sol";
-import "contracts/p0/Main.sol";
-import "contracts/p0/RevenueTrader.sol";
-import "contracts/p0/RToken.sol";
-import "contracts/p0/StRSR.sol";
-import "contracts/interfaces/IAsset.sol";
-import "contracts/interfaces/IDeployer.sol";
-import "contracts/interfaces/IFacade.sol";
-import "contracts/interfaces/IMain.sol";
-import "contracts/libraries/String.sol";
+import "../plugins/assets/Asset.sol";
+import "../plugins/assets/RTokenAsset.sol";
+import "../plugins/trading/DutchTrade.sol";
+import "../plugins/trading/GnosisTrade.sol";
+import "./AssetRegistry.sol";
+import "./BackingManager.sol";
+import "./BasketHandler.sol";
+import "./Broker.sol";
+import "./Distributor.sol";
+import "./Furnace.sol";
+import "./Main.sol";
+import "./RevenueTrader.sol";
+import "./RToken.sol";
+import "./StRSR.sol";
+import "../interfaces/IAsset.sol";
+import "../interfaces/IDeployer.sol";
+import "../interfaces/IMain.sol";
+import "../libraries/String.sol";
+import "../mixins/Versioned.sol";
 
 /**
  * @title DeployerP0
  * @notice The factory contract that deploys the entire P0 system.
  */
-contract DeployerP0 is IDeployer {
+contract DeployerP0 is IDeployer, Versioned {
     string public constant ENS = "reserveprotocol.eth";
+
     IERC20Metadata public immutable rsr;
     IGnosis public immutable gnosis;
-    IFacade public immutable facade;
     IAsset public immutable rsrAsset;
 
     constructor(
         IERC20Metadata rsr_,
         IGnosis gnosis_,
-        IFacade facade_,
         IAsset rsrAsset_
     ) {
         require(
             address(rsr_) != address(0) &&
                 address(gnosis_) != address(0) &&
-                address(facade_) != address(0) &&
                 address(rsrAsset_) != address(0),
             "invalid address"
         );
         rsr = rsr_;
         gnosis = gnosis_;
-        facade = facade_;
         rsrAsset = rsrAsset_;
     }
 
@@ -65,6 +63,8 @@ contract DeployerP0 is IDeployer {
         address owner,
         DeploymentParams memory params
     ) external returns (address) {
+        require(owner != address(0) && owner != address(this), "invalid owner");
+
         MainP0 main = new MainP0();
 
         // Components
@@ -82,11 +82,6 @@ contract DeployerP0 is IDeployer {
             broker: new BrokerP0()
         });
 
-        // Deploy RToken/RSR Assets
-        IAsset[] memory assets = new IAsset[](2);
-        assets[0] = new RTokenAsset(components.rToken, params.rTokenTradingRange);
-        assets[1] = rsrAsset;
-
         // Init Main
         main.init(components, rsr, params.shortFreeze, params.longFreeze);
 
@@ -95,26 +90,36 @@ contract DeployerP0 is IDeployer {
             main,
             params.tradingDelay,
             params.backingBuffer,
-            params.maxTradeSlippage
+            params.maxTradeSlippage,
+            params.minTradeVolume
         );
 
         // Init Basket Handler
-        main.basketHandler().init(main);
+        main.basketHandler().init(main, params.warmupPeriod, params.reweightable);
 
         // Init Revenue Traders
-        main.rsrTrader().init(main, rsr, params.maxTradeSlippage);
-        main.rTokenTrader().init(main, IERC20(address(rToken)), params.maxTradeSlippage);
-
-        // Init Asset Registry
-        main.assetRegistry().init(main, assets);
+        main.rsrTrader().init(main, rsr, params.maxTradeSlippage, params.minTradeVolume);
+        main.rTokenTrader().init(
+            main,
+            IERC20(address(rToken)),
+            params.maxTradeSlippage,
+            params.minTradeVolume
+        );
 
         // Init Distributor
         main.distributor().init(main, params.dist);
 
         // Init Furnace
-        main.furnace().init(main, params.rewardPeriod, params.rewardRatio);
+        main.furnace().init(main, params.rewardRatio);
 
-        main.broker().init(main, gnosis, ITrade(address(1)), params.auctionLength);
+        main.broker().init(
+            main,
+            gnosis,
+            ITrade(address(new GnosisTrade())),
+            params.batchAuctionLength,
+            ITrade(address(new DutchTrade())),
+            params.dutchAuctionLength
+        );
 
         // Init StRSR
         {
@@ -125,8 +130,8 @@ contract DeployerP0 is IDeployer {
                 stRSRName,
                 stRSRSymbol,
                 params.unstakingDelay,
-                params.rewardPeriod,
-                params.rewardRatio
+                params.rewardRatio,
+                params.withdrawalLeak
             );
         }
 
@@ -136,22 +141,33 @@ contract DeployerP0 is IDeployer {
             name,
             symbol,
             mandate,
-            params.issuanceRate,
-            params.maxRedemptionCharge,
-            params.redemptionVirtualSupply
+            params.issuanceThrottle,
+            params.redemptionThrottle
         );
+
+        // Deploy RToken/RSR Assets
+        IAsset[] memory assets = new IAsset[](2);
+        assets[0] = new RTokenAsset(components.rToken, params.rTokenMaxTradeVolume);
+        assets[1] = rsrAsset;
+
+        // Init Asset Registry
+        main.assetRegistry().init(main, assets);
 
         // Transfer Ownership
         main.grantRole(OWNER, owner);
-        main.grantRole(SHORT_FREEZER, owner);
-        main.grantRole(LONG_FREEZER, owner);
-        main.grantRole(PAUSER, owner);
         main.renounceRole(OWNER, address(this));
-        main.renounceRole(SHORT_FREEZER, address(this));
-        main.renounceRole(LONG_FREEZER, address(this));
-        main.renounceRole(PAUSER, address(this));
 
-        emit RTokenCreated(main, components.rToken, components.stRSR, owner);
+        emit RTokenCreated(main, components.rToken, components.stRSR, owner, version());
         return (address(components.rToken));
+    }
+
+    /// @param maxTradeVolume {UoA} The maximum trade volume for the RTokenAsset
+    /// @return rTokenAsset The address of the newly deployed RTokenAsset
+    function deployRTokenAsset(IRToken rToken, uint192 maxTradeVolume)
+        external
+        returns (IAsset rTokenAsset)
+    {
+        rTokenAsset = new RTokenAsset(rToken, maxTradeVolume);
+        emit RTokenAssetCreated(rToken, rTokenAsset);
     }
 }
